@@ -1,0 +1,957 @@
+#!/usr/bin/env python3
+"""
+x86 MASM & Irvine32 Language Server Protocol (LSP) Server
+Provides IntelliSense (autocompletion, hover docs, go-to-definition, document symbols)
+tailored specifically for x86 MASM Assembly and Kip Irvine's Irvine32 library.
+"""
+
+import sys
+import json
+import re
+import os
+
+IRVINE_PROCEDURES = {
+    "Clrscr": {
+        "detail": "procedure Clrscr",
+        "doc": "### `Clrscr` (Irvine32)\nClears the console screen and repositions the cursor at upper-left corner (row 0, col 0).\n\n**Inputs:** None\n**Outputs:** None\n\n```assembly\ncall Clrscr\n```",
+        "snippet": "call Clrscr"
+    },
+    "Crlf": {
+        "detail": "procedure Crlf",
+        "doc": "### `Crlf` (Irvine32)\nWrites an end-of-line carriage return and line feed (\\r\\n) to console.\n\n**Inputs:** None\n**Outputs:** None\n\n```assembly\ncall Crlf\n```",
+        "snippet": "call Crlf"
+    },
+    "WriteString": {
+        "detail": "procedure WriteString (EDX = OFFSET string)",
+        "doc": "### `WriteString` (Irvine32)\nWrites a null-terminated string to standard output.\n\n**Inputs:**\n- `EDX` = offset of null-terminated string (`OFFSET myString`)\n**Outputs:** None\n\n```assembly\nmov edx, OFFSET myMsg\ncall WriteString\n```",
+        "snippet": "mov edx, OFFSET ${1:buffer}\ncall WriteString"
+    },
+    "ReadString": {
+        "detail": "procedure ReadString (EDX = OFFSET buffer, ECX = max count)",
+        "doc": "### `ReadString` (Irvine32)\nReads a string from keyboard until Enter is pressed.\n\n**Inputs:**\n- `EDX` = offset of input buffer\n- `ECX` = maximum characters to accept (including null byte)\n**Outputs:**\n- `EAX` = number of characters actually typed\n\n```assembly\nmov edx, OFFSET buffer\nmov ecx, SIZEOF buffer\ncall ReadString\n```",
+        "snippet": "mov edx, OFFSET ${1:buffer}\nmov ecx, SIZEOF ${1:buffer}\ncall ReadString"
+    },
+    "WriteInt": {
+        "detail": "procedure WriteInt (EAX = 32-bit signed int)",
+        "doc": "### `WriteInt` (Irvine32)\nWrites a 32-bit signed integer to console in decimal with leading + or -.\n\n**Inputs:**\n- `EAX` = signed integer to display\n**Outputs:** None\n\n```assembly\nmov eax, -42\ncall WriteInt\n```",
+        "snippet": "mov eax, ${1:value}\ncall WriteInt"
+    },
+    "ReadInt": {
+        "detail": "procedure ReadInt -> EAX (32-bit signed int)",
+        "doc": "### `ReadInt` (Irvine32)\nReads a 32-bit signed decimal integer from keyboard, ended by Enter.\n\n**Inputs:** None\n**Outputs:**\n- `EAX` = integer entered\n- `Overflow flag (OF)` = set if number exceeds 32 bits\n\n```assembly\ncall ReadInt\nmov myVar, eax\n```",
+        "snippet": "call ReadInt"
+    },
+    "WriteDec": {
+        "detail": "procedure WriteDec (EAX = 32-bit unsigned int)",
+        "doc": "### `WriteDec` (Irvine32)\nWrites a 32-bit unsigned integer to console in decimal (no sign).\n\n**Inputs:**\n- `EAX` = unsigned integer to display\n**Outputs:** None\n\n```assembly\nmov eax, 12345\ncall WriteDec\n```",
+        "snippet": "mov eax, ${1:value}\ncall WriteDec"
+    },
+    "ReadDec": {
+        "detail": "procedure ReadDec -> EAX (32-bit unsigned int)",
+        "doc": "### `ReadDec` (Irvine32)\nReads a 32-bit unsigned decimal integer from keyboard.\n\n**Inputs:** None\n**Outputs:**\n- `EAX` = unsigned integer entered\n- `Carry flag (CF)` = set if invalid or overflow\n\n```assembly\ncall ReadDec\n```",
+        "snippet": "call ReadDec"
+    },
+    "WriteHex": {
+        "detail": "procedure WriteHex (EAX = 32-bit hex)",
+        "doc": "### `WriteHex` (Irvine32)\nWrites a 32-bit integer in hexadecimal format (8 digits).\n\n**Inputs:**\n- `EAX` = integer to display\n**Outputs:** None\n\n```assembly\nmov eax, 0ABCD1234h\ncall WriteHex\n```",
+        "snippet": "mov eax, ${1:value}\ncall WriteHex"
+    },
+    "WriteHexB": {
+        "detail": "procedure WriteHexB (EAX = int, EBX = byte count 1,2,4)",
+        "doc": "### `WriteHexB` (Irvine32)\nWrites a byte, word, or dword in hexadecimal format.\n\n**Inputs:**\n- `EAX` = integer\n- `EBX` = display size: 1 (byte = 2 hex digits), 2 (word = 4 hex digits), 4 (dword = 8 hex digits)\n**Outputs:** None",
+        "snippet": "mov eax, ${1:value}\nmov ebx, ${2:4}\ncall WriteHexB"
+    },
+    "ReadHex": {
+        "detail": "procedure ReadHex -> EAX (32-bit hex)",
+        "doc": "### `ReadHex` (Irvine32)\nReads a 32-bit hexadecimal integer from keyboard.\n\n**Inputs:** None\n**Outputs:**\n- `EAX` = hex value entered\n\n```assembly\ncall ReadHex\n```",
+        "snippet": "call ReadHex"
+    },
+    "WriteBin": {
+        "detail": "procedure WriteBin (EAX = 32-bit binary)",
+        "doc": "### `WriteBin` (Irvine32)\nWrites a 32-bit integer to console in binary (32 digits formatted with spaces).\n\n**Inputs:**\n- `EAX` = integer to display\n**Outputs:** None\n\n```assembly\nmov eax, 101010b\ncall WriteBin\n```",
+        "snippet": "mov eax, ${1:value}\ncall WriteBin"
+    },
+    "WriteChar": {
+        "detail": "procedure WriteChar (AL = ASCII char)",
+        "doc": "### `WriteChar` (Irvine32)\nWrites a single character to console.\n\n**Inputs:**\n- `AL` = ASCII character\n**Outputs:** None\n\n```assembly\nmov al, 'A'\ncall WriteChar\n```",
+        "snippet": "mov al, '${1:A}'\ncall WriteChar"
+    },
+    "ReadChar": {
+        "detail": "procedure ReadChar -> AL (ASCII), AH (scan code)",
+        "doc": "### `ReadChar` (Irvine32)\nReads a single character from keyboard without waiting for Enter (no echo).\n\n**Inputs:** None\n**Outputs:**\n- `AL` = ASCII character\n- `AH` = keyboard scan code\n\n```assembly\ncall ReadChar\n```",
+        "snippet": "call ReadChar"
+    },
+    "DumpRegs": {
+        "detail": "procedure DumpRegs",
+        "doc": "### `DumpRegs` (Irvine32)\nDisplays current values of general registers (`EAX`, `EBX`, `ECX`, `EDX`, `ESI`, `EDI`, `EBP`, `ESP`), `EIP`, and CPU flags (`CF`, `ZF`, `SF`, `OF`, `AF`, `PF`).\n\n**Inputs:** None\n**Outputs:** None\n\n```assembly\ncall DumpRegs\n```",
+        "snippet": "call DumpRegs"
+    },
+    "DumpMem": {
+        "detail": "procedure DumpMem (ESI = start, ECX = count, EBX = unitSize)",
+        "doc": "### `DumpMem` (Irvine32)\nWrites a block of memory to the console in hexadecimal format.\n\n**Inputs:**\n- `ESI` = starting memory address (`OFFSET array`)\n- `ECX` = number of units to display\n- `EBX` = unit size (1 = BYTE, 2 = WORD, 4 = DWORD)\n**Outputs:** None\n\n```assembly\nmov esi, OFFSET array\nmov ecx, LENGTHOF array\nmov ebx, TYPE array\ncall DumpMem\n```",
+        "snippet": "mov esi, OFFSET ${1:array}\nmov ecx, LENGTHOF ${1:array}\nmov ebx, TYPE ${1:array}\ncall DumpMem"
+    },
+    "Randomize": {
+        "detail": "procedure Randomize",
+        "doc": "### `Randomize` (Irvine32)\nSeeds the pseudo-random number generator with current system time. Call once at beginning of program.\n\n**Inputs:** None\n**Outputs:** None\n\n```assembly\ncall Randomize\n```",
+        "snippet": "call Randomize"
+    },
+    "RandomRange": {
+        "detail": "procedure RandomRange (EAX = limit n) -> EAX (0..n-1)",
+        "doc": "### `RandomRange` (Irvine32)\nGenerates pseudo-random integer in range 0 to n - 1.\n\n**Inputs:**\n- `EAX` = upper limit (exclusive)\n**Outputs:**\n- `EAX` = random integer from 0 to n-1\n\n```assembly\nmov eax, 100       ; generates 0..99\ncall RandomRange\n```",
+        "snippet": "mov eax, ${1:limit}\ncall RandomRange"
+    },
+    "Random32": {
+        "detail": "procedure Random32 -> EAX (0..FFFFFFFFh)",
+        "doc": "### `Random32` (Irvine32)\nGenerates a 32-bit pseudo-random integer across full 32-bit range.\n\n**Inputs:** None\n**Outputs:**\n- `EAX` = 32-bit pseudo-random value\n\n```assembly\ncall Random32\n```",
+        "snippet": "call Random32"
+    },
+    "Gotoxy": {
+        "detail": "procedure Gotoxy (DH = row 0..24, DL = col 0..79)",
+        "doc": "### `Gotoxy` (Irvine32)\nPositions console cursor at coordinates (row, column).\n\n**Inputs:**\n- `DH` = row number (0 to 24)\n- `DL` = column number (0 to 79)\n**Outputs:** None\n\n```assembly\nmov dh, 10    ; row 10\nmov dl, 20    ; column 20\ncall Gotoxy\n```",
+        "snippet": "mov dh, ${1:10}\nmov dl, ${2:20}\ncall Gotoxy"
+    },
+    "SetTextColor": {
+        "detail": "procedure SetTextColor (EAX = color attribute)",
+        "doc": "### `SetTextColor` (Irvine32)\nSets console foreground and background colors.\nFormula: `EAX = foreground + (background * 16)`\n\n**Inputs:**\n- `EAX` = color code (`e.g. yellow + (blue * 16)`)\n**Outputs:** None\n\n```assembly\nmov eax, yellow + (blue * 16)\ncall SetTextColor\n```",
+        "snippet": "mov eax, ${1:yellow} + (${2:blue} * 16)\ncall SetTextColor"
+    },
+    "GetTextColor": {
+        "detail": "procedure GetTextColor -> AL",
+        "doc": "### `GetTextColor` (Irvine32)\nRetrieves current console foreground and background color attribute.\n\n**Outputs:**\n- `AL` = color attribute",
+        "snippet": "call GetTextColor"
+    },
+    "Delay": {
+        "detail": "procedure Delay (EAX = milliseconds)",
+        "doc": "### `Delay` (Irvine32)\nPauses program execution for specified number of milliseconds.\n\n**Inputs:**\n- `EAX` = delay duration in milliseconds\n**Outputs:** None\n\n```assembly\nmov eax, 1000   ; 1 second delay\ncall Delay\n```",
+        "snippet": "mov eax, ${1:1000}\ncall Delay"
+    },
+    "GetMseconds": {
+        "detail": "procedure GetMseconds -> EAX",
+        "doc": "### `GetMseconds` (Irvine32)\nReturns milliseconds elapsed since midnight.\n\n**Inputs:** None\n**Outputs:**\n- `EAX` = milliseconds since midnight\n\n```assembly\ncall GetMseconds\n```",
+        "snippet": "call GetMseconds"
+    },
+    "WaitMsg": {
+        "detail": "procedure WaitMsg",
+        "doc": "### `WaitMsg` (Irvine32)\nDisplays *'Press [Enter] to continue...'* and waits for user to press Enter.\n\n**Inputs:** None\n**Outputs:** None\n\n```assembly\ncall WaitMsg\n```",
+        "snippet": "call WaitMsg"
+    },
+    "IsDigit": {
+        "detail": "procedure IsDigit (AL = char) -> ZF=1 if digit",
+        "doc": "### `IsDigit` (Irvine32)\nChecks if ASCII character in AL is a decimal digit ('0'..'9').\n\n**Inputs:**\n- `AL` = character\n**Outputs:**\n- `Zero flag (ZF)` = 1 if AL is digit, 0 otherwise",
+        "snippet": "call IsDigit"
+    },
+    "ParseDecimal32": {
+        "detail": "procedure ParseDecimal32 (EDX=str, ECX=len) -> EAX",
+        "doc": "### `ParseDecimal32` (Irvine32)\nConverts unsigned decimal string to 32-bit binary integer.\n\n**Inputs:**\n- `EDX` = string offset\n- `ECX` = string length\n**Outputs:**\n- `EAX` = integer value\n- `Carry flag (CF)` = 1 on overflow/error",
+        "snippet": "mov edx, OFFSET ${1:str}\nmov ecx, ${2:len}\ncall ParseDecimal32"
+    },
+    "ParseInteger32": {
+        "detail": "procedure ParseInteger32 (EDX=str, ECX=len) -> EAX",
+        "doc": "### `ParseInteger32` (Irvine32)\nConverts signed decimal string to 32-bit binary integer.\n\n**Inputs:**\n- `EDX` = string offset\n- `ECX` = string length\n**Outputs:**\n- `EAX` = signed integer value\n- `Carry flag (CF)` = 1 on overflow/error",
+        "snippet": "mov edx, OFFSET ${1:str}\nmov ecx, ${2:len}\ncall ParseInteger32"
+    },
+    "Str_length": {
+        "detail": "procedure Str_length (EDX = OFFSET str) -> EAX",
+        "doc": "### `Str_length` (Irvine32)\nCalculates the length of a null-terminated string (excluding null byte).\n\n**Inputs:**\n- `EDX` = offset of null-terminated string\n**Outputs:**\n- `EAX` = length of string",
+        "snippet": "mov edx, OFFSET ${1:myString}\ncall Str_length"
+    },
+    "Str_compare": {
+        "detail": "procedure Str_compare (ESI=str1, EDI=str2)",
+        "doc": "### `Str_compare` (Irvine32)\nCompares two null-terminated strings case-sensitively.\n\n**Inputs:**\n- `ESI` = string 1 offset\n- `EDI` = string 2 offset\n**Outputs:** Flags set as if `CMP str1, str2`",
+        "snippet": "mov esi, OFFSET ${1:str1}\nmov edi, OFFSET ${2:str2}\ncall Str_compare"
+    },
+    "Str_copy": {
+        "detail": "procedure Str_copy (ESI=source, EDI=dest)",
+        "doc": "### `Str_copy` (Irvine32)\nCopies null-terminated string from source to destination buffer.\n\n**Inputs:**\n- `ESI` = source string offset\n- `EDI` = destination buffer offset\n**Outputs:** None",
+        "snippet": "mov esi, OFFSET ${1:source}\nmov edi, OFFSET ${2:target}\ncall Str_copy"
+    },
+    "Str_ucase": {
+        "detail": "procedure Str_ucase (EDX = OFFSET str)",
+        "doc": "### `Str_ucase` (Irvine32)\nConverts null-terminated string to uppercase in-place.\n\n**Inputs:**\n- `EDX` = string offset\n**Outputs:** None",
+        "snippet": "mov edx, OFFSET ${1:myString}\ncall Str_ucase"
+    },
+    "MsgBox": {
+        "detail": "procedure MsgBox (EDX = msg, EBX = title)",
+        "doc": "### `MsgBox` (Irvine32)\nDisplays a graphical Windows message box with OK button.\n\n**Inputs:**\n- `EDX` = null-terminated message string offset\n- `EBX` = null-terminated title string offset",
+        "snippet": "mov edx, OFFSET ${1:msg}\nmov ebx, OFFSET ${2:title}\ncall MsgBox"
+    },
+    "MsgBoxAsk": {
+        "detail": "procedure MsgBoxAsk (EDX = msg, EBX = title) -> EAX",
+        "doc": "### `MsgBoxAsk` (Irvine32)\nDisplays a graphical Windows Yes/No message box.\n\n**Inputs:**\n- `EDX` = message offset\n- `EBX` = title offset\n**Outputs:**\n- `EAX` = IDYES (6) or IDNO (7)",
+        "snippet": "mov edx, OFFSET ${1:msg}\nmov ebx, OFFSET ${2:title}\ncall MsgBoxAsk"
+    }
+}
+
+IRVINE_MACROS = {
+    "mWrite": {
+        "detail": "macro mWrite \"text\"",
+        "doc": "### `mWrite` Macro (Irvine32)\nWrites a string literal directly to standard output without having to define it in the `.data` segment.\n\n```assembly\nmWrite \"Enter your score: \"\n```",
+        "snippet": "mWrite \"${1:text}\""
+    },
+    "mWriteLn": {
+        "detail": "macro mWriteLn \"text\"",
+        "doc": "### `mWriteLn` Macro (Irvine32)\nWrites a string literal followed by a newline (CRLF) directly to standard output.\n\n```assembly\nmWriteLn \"Operation completed successfully.\"\n```",
+        "snippet": "mWriteLn \"${1:text}\""
+    },
+    "mReadString": {
+        "detail": "macro mReadString buffer",
+        "doc": "### `mReadString` Macro (Irvine32)\nInputs a string from keyboard into the specified buffer variable.\n\n```assembly\nmReadString myBuffer\n```",
+        "snippet": "mReadString ${1:buffer}"
+    },
+    "mGotoxy": {
+        "detail": "macro mGotoxy X, Y",
+        "doc": "### `mGotoxy` Macro (Irvine32)\nPositions console cursor at column X and row Y using the Irvine macro.\n\n```assembly\nmGotoxy 20, 10\n```",
+        "snippet": "mGotoxy ${1:col}, ${2:row}"
+    },
+    "mDumpMem": {
+        "detail": "macro mDumpMem address, itemCount, unitSize",
+        "doc": "### `mDumpMem` Macro (Irvine32)\nDumps memory block to console.\n\n```assembly\nmDumpMem OFFSET array, 10, 4\n```",
+        "snippet": "mDumpMem OFFSET ${1:array}, ${2:count}, ${3:4}"
+    }
+}
+
+IRVINE_COLORS = [
+    ("black", "Color 0: black"),
+    ("blue", "Color 1: blue"),
+    ("green", "Color 2: green"),
+    ("cyan", "Color 3: cyan"),
+    ("red", "Color 4: red"),
+    ("magenta", "Color 5: magenta"),
+    ("brown", "Color 6: brown"),
+    ("lightGray", "Color 7: lightGray"),
+    ("gray", "Color 8: gray"),
+    ("lightBlue", "Color 9: lightBlue"),
+    ("lightGreen", "Color 10: lightGreen"),
+    ("lightCyan", "Color 11: lightCyan"),
+    ("lightRed", "Color 12: lightRed"),
+    ("lightMagenta", "Color 13: lightMagenta"),
+    ("yellow", "Color 14: yellow"),
+    ("white", "Color 15: white")
+]
+
+X86_REGISTERS = {
+    # 32-bit
+    "eax": ("32-bit General / Accumulator", "Standard accumulator register. Used for arithmetic, function return values (e.g. `ReadInt`), and operands."),
+    "ebx": ("32-bit General / Base", "Base register for pointer arithmetic or memory addressing."),
+    "ecx": ("32-bit General / Counter", "Loop counter for `LOOP`, string repeat prefixes (`REP`), and shift/rotate counts (`CL`)."),
+    "edx": ("32-bit General / Data & I/O", "Data register. Used with EAX in 64-bit multiply/divide and points to strings in Irvine procedures (`WriteString`, `ReadString`)."),
+    "esi": ("32-bit Source Index", "Source index register for string/memory operations and array indexing."),
+    "edi": ("32-bit Destination Index", "Destination index register for string/memory operations."),
+    "ebp": ("32-bit Base Pointer", "Base pointer for accessing stack parameters and local variables in stack frames."),
+    "esp": ("32-bit Stack Pointer", "Stack pointer pointing to current top of runtime stack."),
+    "eip": ("32-bit Instruction Pointer", "Instruction pointer containing address of the next machine instruction."),
+    "eflags": ("32-bit Flags Register", "Status and control flags (CF, ZF, SF, OF, AF, PF, DF, IF)."),
+    # 16-bit
+    "ax": ("16-bit Accumulator", "Lower 16 bits of EAX (AH + AL)."),
+    "bx": ("16-bit Base", "Lower 16 bits of EBX (BH + BL)."),
+    "cx": ("16-bit Counter", "Lower 16 bits of ECX (CH + CL)."),
+    "dx": ("16-bit Data", "Lower 16 bits of EDX (DH + DL)."),
+    "si": ("16-bit Source Index", "Lower 16 bits of ESI."),
+    "di": ("16-bit Destination Index", "Lower 16 bits of EDI."),
+    "bp": ("16-bit Base Pointer", "Lower 16 bits of EBP."),
+    "sp": ("16-bit Stack Pointer", "Lower 16 bits of ESP."),
+    # 8-bit
+    "al": ("8-bit Accumulator Low", "Bits 0..7 of EAX. Used for character I/O (`WriteChar`, `ReadChar`)."),
+    "ah": ("8-bit Accumulator High", "Bits 8..15 of EAX. Returns keyboard scan codes in `ReadChar`."),
+    "bl": ("8-bit Base Low", "Bits 0..7 of EBX."),
+    "bh": ("8-bit Base High", "Bits 8..15 of EBX."),
+    "cl": ("8-bit Counter Low", "Bits 0..7 of ECX. Used as shift/rotate count in `SHL`, `SHR`, etc."),
+    "ch": ("8-bit Counter High", "Bits 8..15 of ECX."),
+    "dl": ("8-bit Data Low", "Bits 0..7 of EDX. Holds column in `Gotoxy`."),
+    "dh": ("8-bit Data High", "Bits 8..15 of EDX. Holds row in `Gotoxy`.")
+}
+
+X86_INSTRUCTIONS = {
+    "mov": ("mov dest, src", "Copies `src` to `dest`. Both operands must be the same size. Flags: None affected."),
+    "movsx": ("movsx dest, src", "Move with sign-extension. Copies smaller signed operand to larger destination register."),
+    "movzx": ("movzx dest, src", "Move with zero-extension. Copies smaller unsigned operand to larger destination register."),
+    "xchg": ("xchg reg, reg/mem", "Exchanges contents of two operands. At least one must be a register."),
+    "lea": ("lea reg32, mem", "Load Effective Address. Calculates memory address of source and loads into destination register."),
+    "push": ("push src", "Decrements ESP and copies 16-bit or 32-bit operand onto top of stack."),
+    "pop": ("pop dest", "Copies value from top of stack into destination operand and increments ESP."),
+    "pushad": ("pushad", "Pushes all 32-bit general-purpose registers onto stack in order: EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI."),
+    "popad": ("popad", "Pops all 32-bit general-purpose registers off stack in reverse order of PUSHAD."),
+    "pushfd": ("pushfd", "Pushes 32-bit EFLAGS register onto stack."),
+    "popfd": ("popfd", "Pops 32-bit value from stack into EFLAGS register."),
+    "add": ("add dest, src", "Adds `src` to `dest` (`dest = dest + src`). Modifies CF, ZF, SF, OF, AF, PF."),
+    "sub": ("sub dest, src", "Subtracts `src` from `dest` (`dest = dest - src`). Modifies CF, ZF, SF, OF, AF, PF."),
+    "inc": ("inc dest", "Increments destination by 1 (`dest++`). Modifies OF, SF, ZF, AF, PF (CF unaffected)."),
+    "dec": ("dec dest", "Decrements destination by 1 (`dest--`). Modifies OF, SF, ZF, AF, PF (CF unaffected)."),
+    "neg": ("neg dest", "Calculates two's complement negation (`dest = -dest`). Sets CF=1 unless dest was 0."),
+    "mul": ("mul src", "Unsigned integer multiply. For 32-bit operand: `EDX:EAX = EAX * src`. Sets CF/OF=1 if upper half != 0."),
+    "imul": ("imul reg, src", "Signed integer multiply. Can be 1-operand (`EDX:EAX = EAX * src`), 2-operand (`reg = reg * src`), or 3-operand."),
+    "div": ("div src", "Unsigned integer division. For 32-bit operand: divides `EDX:EAX` by `src`. Quotient stored in `EAX`, remainder in `EDX`."),
+    "idiv": ("idiv src", "Signed integer division. For 32-bit operand: divides `EDX:EAX` by `src`. Requires CDQ beforehand to sign-extend EAX into EDX. Quotient in `EAX`, remainder in `EDX`."),
+    "cdq": ("cdq", "Convert Doubleword to Quadword. Sign-extends 32-bit EAX into EDX:EAX before running `idiv`."),
+    "cmp": ("cmp dest, src", "Compares `dest` and `src` by computing `dest - src` without saving result. Sets CF, ZF, SF, OF according to comparison."),
+    "jmp": ("jmp label", "Unconditional jump to specified label address."),
+    "je": ("je label", "Jump if Equal (`ZF == 1`). Equivalent to `jz`."),
+    "jz": ("jz label", "Jump if Zero (`ZF == 1`). Equivalent to `je`."),
+    "jne": ("jne label", "Jump if Not Equal (`ZF == 0`). Equivalent to `jnz`."),
+    "jnz": ("jnz label", "Jump if Not Zero (`ZF == 0`). Equivalent to `jne`."),
+    "jg": ("jg label", "Jump if Greater (signed: `ZF == 0 and SF == OF`)."),
+    "jge": ("jge label", "Jump if Greater or Equal (signed: `SF == OF`)."),
+    "jl": ("jl label", "Jump if Less (signed: `SF != OF`)."),
+    "jle": ("jle label", "Jump if Less or Equal (signed: `ZF == 1 or SF != OF`)."),
+    "ja": ("ja label", "Jump if Above (unsigned: `CF == 0 and ZF == 0`)."),
+    "jae": ("jae label", "Jump if Above or Equal (unsigned: `CF == 0`)."),
+    "jb": ("jb label", "Jump if Below (unsigned: `CF == 1`)."),
+    "jbe": ("jbe label", "Jump if Below or Equal (unsigned: `CF == 1 or ZF == 1`)."),
+    "jc": ("jc label", "Jump if Carry flag set (`CF == 1`)."),
+    "jnc": ("jnc label", "Jump if Carry flag clear (`CF == 0`)."),
+    "jo": ("jo label", "Jump if Overflow flag set (`OF == 1`)."),
+    "jno": ("jno label", "Jump if Overflow flag clear (`OF == 0`)."),
+    "js": ("js label", "Jump if Sign flag set (`SF == 1`, negative result)."),
+    "jns": ("jns label", "Jump if Sign flag clear (`SF == 0`, positive/zero result)."),
+    "loop": ("loop label", "Decrements ECX; if `ECX != 0`, jumps to target label."),
+    "loope": ("loope label", "Loop while equal: decrements ECX; if `ECX != 0 and ZF == 1`, jumps to label."),
+    "loopne": ("loopne label", "Loop while not equal: decrements ECX; if `ECX != 0 and ZF == 0`, jumps to label."),
+    "call": ("call target", "Calls procedure by pushing return address (EIP) onto stack and jumping to target."),
+    "ret": ("ret [bytes]", "Returns from procedure by popping return address off stack into EIP. Optional immediate pops bytes from parameter stack."),
+    "and": ("and dest, src", "Bitwise AND (`dest = dest & src`). Clears OF and CF, modifies ZF, SF, PF."),
+    "or": ("or dest, src", "Bitwise OR (`dest = dest | src`). Clears OF and CF, modifies ZF, SF, PF."),
+    "xor": ("xor dest, src", "Bitwise XOR (`dest = dest ^ src`). Often used to zero registers (`xor eax, eax`). Clears OF and CF."),
+    "not": ("not dest", "One's complement bitwise NOT (`dest = ~dest`). Flags are unaffected."),
+    "test": ("test dest, src", "Performs nondestructive bitwise AND (`dest & src`). Sets ZF, SF, PF; clears OF, CF."),
+    "shl": ("shl dest, count", "Logical Shift Left: shifts bits left, filling lowest bits with 0. Highest bit shifted into CF."),
+    "shr": ("shr dest, count", "Logical Shift Right: shifts bits right, filling highest bits with 0. Lowest bit shifted into CF."),
+    "sal": ("sal dest, count", "Shift Arithmetic Left: identical to SHL."),
+    "sar": ("sar dest, count", "Shift Arithmetic Right: shifts bits right while preserving sign bit (arithmetic division by 2^n)."),
+    "rol": ("rol dest, count", "Rotate Left: rotates bits left, wrapping leftmost bit into CF and bit 0."),
+    "ror": ("ror dest, count", "Rotate Right: rotates bits right, wrapping rightmost bit into CF and highest bit."),
+    "nop": ("nop", "No operation. Consumes 1 byte (0x90) and 1 clock cycle."),
+    "clc": ("clc", "Clear Carry Flag (`CF = 0`)."),
+    "stc": ("stc", "Set Carry Flag (`CF = 1`)."),
+    "cld": ("cld", "Clear Direction Flag (`DF = 0`), causes string instructions to process forward (low to high addresses)."),
+    "std": ("std", "Set Direction Flag (`DF = 1`), causes string instructions to process backward (high to low addresses)."),
+    "exit": ("exit", "Irvine32 exit macro: calls Win32 ExitProcess(0).")
+}
+
+MASM_DIRECTIVES = {
+    ".data": ("Directive: .data", "Marks the start of the initialized data segment where variables are declared."),
+    ".data?": ("Directive: .data?", "Marks the uninitialized data segment."),
+    ".code": ("Directive: .code", "Marks the start of the executable code segment."),
+    ".stack": ("Directive: .stack [size]", "Defines runtime stack segment size in bytes (e.g. `.stack 4096`)."),
+    ".model": ("Directive: .model memory_model, language_type", "Initializes program memory model (e.g. `.model flat, stdcall`)."),
+    ".386": ("Directive: .386", "Enables 80386 instruction set and 32-bit registers."),
+    "INCLUDE": ("Directive: INCLUDE filename", "Inserts source code from specified file (e.g. `INCLUDE Irvine32.inc`)."),
+    "INCLUDELIB": ("Directive: INCLUDELIB libname", "Specifies link library file (e.g. `INCLUDELIB Irvine32.lib`)."),
+    "PROC": ("Directive: label PROC [attributes]", "Begins a procedure block. Must end with `label ENDP`."),
+    "ENDP": ("Directive: label ENDP", "Marks the end of a procedure block."),
+    "PROTO": ("Directive: name PROTO [paramList]", "Declares a procedure prototype for type checking with `INVOKE`."),
+    "INVOKE": ("Directive: INVOKE procedureName [, args...]", "Calls a procedure, passing arguments on stack according to convention."),
+    "OFFSET": ("Operator: OFFSET identifier", "Returns linear offset (32-bit address) of variable from start of data segment."),
+    "PTR": ("Operator: type PTR expression", "Overrides or specifies default type size of memory address (e.g. `DWORD PTR [esi]`)."),
+    "TYPE": ("Operator: TYPE identifier", "Returns size in bytes of each element in variable (1 for BYTE, 2 for WORD, 4 for DWORD)."),
+    "LENGTHOF": ("Operator: LENGTHOF identifier", "Returns number of elements in array defined on a single line."),
+    "SIZEOF": ("Operator: SIZEOF identifier", "Returns total bytes occupied by array (`SIZEOF = LENGTHOF * TYPE`)."),
+    "BYTE": ("Data Type: BYTE", "Allocates 8-bit unsigned integer (0..255) or character."),
+    "SBYTE": ("Data Type: SBYTE", "Allocates 8-bit signed integer (-128..+127)."),
+    "WORD": ("Data Type: WORD", "Allocates 16-bit unsigned integer (0..65535)."),
+    "SWORD": ("Data Type: SWORD", "Allocates 16-bit signed integer (-32768..+32767)."),
+    "DWORD": ("Data Type: DWORD", "Allocates 32-bit unsigned integer (0..4294967295) or memory address."),
+    "SDWORD": ("Data Type: SDWORD", "Allocates 32-bit signed integer (-2147483648..+2147483647)."),
+    "REAL4": ("Data Type: REAL4", "Allocates 32-bit IEEE 754 single-precision floating point number."),
+    "REAL8": ("Data Type: REAL8", "Allocates 64-bit IEEE 754 double-precision floating point number."),
+    "EQU": ("Directive: name EQU expression", "Defines symbolic constant that cannot be redefined."),
+    "=": ("Directive: name = expression", "Defines numeric constant that CAN be redefined later."),
+    "DUP": ("Operator: count DUP (initialValue)", "Duplicates initial value count times (e.g. `100 DUP(?)`)."),
+    "END": ("Directive: END [startLabel]", "Marks the end of source file and optionally identifies program entry point (e.g. `END main`).")
+}
+
+TEMPLATES = {
+    "template-irvine32": {
+        "detail": "Template: Standard MASM + Irvine32 Program",
+        "doc": "Inserts complete starter template for an x86 MASM program using Irvine32.",
+        "snippet": "TITLE ${1:Program Title}\n\nINCLUDE Irvine32.inc\n\n.data\n    ${2:myMsg} BYTE \"${3:Hello, World!}\", 0\n\n.code\nmain PROC\n    mov edx, OFFSET ${2:myMsg}\n    call WriteString\n    call Crlf\n\n    exit\nmain ENDP\nEND main\n"
+    }
+}
+
+class DocumentSymbols:
+    def __init__(self):
+        self.procedures = {}  # name -> (line, signature)
+        self.labels = {}      # name -> (line, text)
+        self.variables = {}   # name -> (line, type, init_val)
+        self.constants = {}   # name -> (line, val)
+
+def parse_document(text: str) -> DocumentSymbols:
+    symbols = DocumentSymbols()
+    lines = text.split("\n")
+    
+    # regexes
+    proc_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+PROC\b(.*)$", re.IGNORECASE)
+    label_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s*:\s*(?:;.*)?$", re.IGNORECASE)
+    var_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+(BYTE|SBYTE|WORD|SWORD|DWORD|SDWORD|QWORD|REAL4|REAL8|TBYTE)\s+(.*?)(?:;.*)?$", re.IGNORECASE)
+    const_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+(=|EQU)\s+(.*?)(?:;.*)?$", re.IGNORECASE)
+
+    for i, line in enumerate(lines):
+        clean = line.strip()
+        if not clean or clean.startswith(";") or clean.startswith("#"):
+            continue
+            
+        m_proc = proc_pattern.match(line)
+        if m_proc:
+            name = m_proc.group(1)
+            rest = m_proc.group(2).strip()
+            symbols.procedures[name] = (i, f"{name} PROC {rest}".strip())
+            continue
+
+        m_var = var_pattern.match(line)
+        if m_var:
+            name = m_var.group(1)
+            var_type = m_var.group(2).upper()
+            val = m_var.group(3).strip()
+            symbols.variables[name] = (i, var_type, val)
+            continue
+
+        m_const = const_pattern.match(line)
+        if m_const:
+            name = m_const.group(1)
+            val = m_const.group(3).strip()
+            symbols.constants[name] = (i, val)
+            continue
+
+        m_lbl = label_pattern.match(line)
+        if m_lbl:
+            name = m_lbl.group(1)
+            symbols.labels[name] = (i, line.strip())
+            continue
+
+    return symbols
+
+
+class MasmServer:
+    def __init__(self):
+        self.documents = {}  # uri -> text
+        self.symbols = {}    # uri -> DocumentSymbols
+
+    def get_word_at_pos(self, text: str, line: int, char: int) -> str:
+        lines = text.split("\n")
+        if line >= len(lines):
+            return ""
+        cur_line = lines[line]
+        if not cur_line:
+            return ""
+        if char > len(cur_line):
+            char = len(cur_line)
+        
+        # If cursor is at the boundary after a word, look back 1 char
+        idx = char
+        if idx >= len(cur_line) or not (cur_line[idx].isalnum() or cur_line[idx] in "_@$?"):
+            if idx > 0 and (cur_line[idx-1].isalnum() or cur_line[idx-1] in "_@$?"):
+                idx -= 1
+            else:
+                return ""
+        
+        start = idx
+        while start > 0 and (cur_line[start-1].isalnum() or cur_line[start-1] in "_@$?"):
+            start -= 1
+        end = idx
+        while end < len(cur_line) and (cur_line[end].isalnum() or cur_line[end] in "_@$?"):
+            end += 1
+        return cur_line[start:end]
+
+    def get_line_prefix(self, text: str, line: int, char: int) -> str:
+        lines = text.split("\n")
+        if line >= len(lines):
+            return ""
+        return lines[line][:char]
+
+    def handle_completion(self, uri: str, line: int, char: int):
+        doc = self.documents.get(uri, "")
+        prefix = self.get_line_prefix(doc, line, char)
+        doc_syms = self.symbols.get(uri, DocumentSymbols())
+        
+        items = []
+
+        # Context detection
+        stripped_prefix = prefix.strip()
+        is_call = bool(re.search(r"\bcall\s+[a-zA-Z0-9_@$?]*$", prefix, re.IGNORECASE))
+        is_offset = bool(re.search(r"\bOFFSET\s+[a-zA-Z0-9_@$?]*$", prefix, re.IGNORECASE))
+        is_jump = bool(re.search(r"\bj[a-z]{1,4}\s+[a-zA-Z0-9_@$?]*$", prefix, re.IGNORECASE))
+        is_loop = bool(re.search(r"\bloop[a-z]{0,2}\s+[a-zA-Z0-9_@$?]*$", prefix, re.IGNORECASE))
+
+        # 1. Irvine Procedures
+        proc_sort_priority = "01" if is_call else "05"
+        for name, data in IRVINE_PROCEDURES.items():
+            items.append({
+                "label": name,
+                "kind": 3,  # Function
+                "detail": data["detail"],
+                "documentation": {"kind": "markdown", "value": data["doc"]},
+                "insertText": name,
+                "sortText": f"{proc_sort_priority}_{name}"
+            })
+
+        # 2. User Procedures
+        for name, (l_num, sig) in doc_syms.procedures.items():
+            items.append({
+                "label": name,
+                "kind": 3,  # Function
+                "detail": f"User procedure: {sig}",
+                "documentation": {"kind": "markdown", "value": f"Defined at line {l_num + 1}:\n```assembly\n{sig}\n```"},
+                "insertText": name,
+                "sortText": f"02_{name}" if is_call else f"06_{name}"
+            })
+
+        # 3. User Variables (High priority if after OFFSET)
+        var_sort_priority = "01" if is_offset else "07"
+        for name, (l_num, vtype, val) in doc_syms.variables.items():
+            items.append({
+                "label": name,
+                "kind": 6,  # Variable
+                "detail": f"{name} {vtype} {val}",
+                "documentation": {"kind": "markdown", "value": f"**Variable** defined at line {l_num + 1}:\n```assembly\n{name} {vtype} {val}\n```"},
+                "insertText": name,
+                "sortText": f"{var_sort_priority}_{name}"
+            })
+
+        # 4. User Labels (High priority if after jump/loop)
+        lbl_sort_priority = "01" if (is_jump or is_loop) else "08"
+        for name, (l_num, text_lbl) in doc_syms.labels.items():
+            items.append({
+                "label": name,
+                "kind": 7,  # Label / Class
+                "detail": f"Label: {name}",
+                "documentation": {"kind": "markdown", "value": f"**Jump Label** defined at line {l_num + 1}"},
+                "insertText": name,
+                "sortText": f"{lbl_sort_priority}_{name}"
+            })
+
+        # 5. User Constants
+        for name, (l_num, val) in doc_syms.constants.items():
+            items.append({
+                "label": name,
+                "kind": 21,  # Constant
+                "detail": f"Constant: {name} = {val}",
+                "documentation": {"kind": "markdown", "value": f"Constant defined at line {l_num + 1}:\n`{name} = {val}`"},
+                "insertText": name,
+                "sortText": f"08_{name}"
+            })
+
+        # 6. Irvine Macros
+        for name, data in IRVINE_MACROS.items():
+            items.append({
+                "label": name,
+                "kind": 15,  # Snippet
+                "detail": data["detail"],
+                "documentation": {"kind": "markdown", "value": data["doc"]},
+                "insertText": data["snippet"],
+                "insertTextFormat": 2,  # Snippet
+                "sortText": f"04_{name}"
+            })
+
+        # 7. Irvine Colors
+        for name, desc in IRVINE_COLORS:
+            items.append({
+                "label": name,
+                "kind": 21,  # Constant
+                "detail": f"Irvine32 color: {name}",
+                "documentation": {"kind": "markdown", "value": f"**Irvine32 Console Color**\n{desc}"},
+                "insertText": name,
+                "sortText": f"12_{name}"
+            })
+
+        # 8. x86 Registers
+        for reg, (role, desc) in X86_REGISTERS.items():
+            items.append({
+                "label": reg,
+                "kind": 6,  # Variable
+                "detail": f"Register: {reg.upper()} ({role})",
+                "documentation": {"kind": "markdown", "value": f"### `{reg.upper()}`\n**Role:** {role}\n\n{desc}"},
+                "insertText": reg,
+                "sortText": f"10_{reg}"
+            })
+
+        # 9. x86 Instructions
+        for instr, (syntax, desc) in X86_INSTRUCTIONS.items():
+            items.append({
+                "label": instr,
+                "kind": 14,  # Keyword
+                "detail": syntax,
+                "documentation": {"kind": "markdown", "value": f"### `{instr.upper()}`\n**Syntax:** `{syntax}`\n\n{desc}"},
+                "insertText": instr,
+                "sortText": f"15_{instr}"
+            })
+
+        # 10. MASM Directives
+        for directive, (syntax, desc) in MASM_DIRECTIVES.items():
+            items.append({
+                "label": directive,
+                "kind": 14,  # Keyword
+                "detail": syntax,
+                "documentation": {"kind": "markdown", "value": f"### `{directive}`\n{desc}"},
+                "insertText": directive,
+                "sortText": f"20_{directive}"
+            })
+
+        # 11. Templates / Snippets
+        for key, t_data in TEMPLATES.items():
+            items.append({
+                "label": key,
+                "kind": 15,  # Snippet
+                "detail": t_data["detail"],
+                "documentation": {"kind": "markdown", "value": t_data["doc"]},
+                "insertText": t_data["snippet"],
+                "insertTextFormat": 2,
+                "sortText": f"00_{key}"
+            })
+
+        return {"isIncomplete": False, "items": items}
+
+    def handle_hover(self, uri: str, line: int, char: int):
+        doc = self.documents.get(uri, "")
+        word = self.get_word_at_pos(doc, line, char)
+        if not word:
+            return None
+
+        # Case-insensitive lookup
+        word_lower = word.lower()
+
+        # 1. Check Irvine Procedures
+        for name, data in IRVINE_PROCEDURES.items():
+            if name.lower() == word_lower:
+                return {
+                    "contents": {
+                        "kind": "markdown",
+                        "value": data["doc"]
+                    }
+                }
+
+        # 2. Check Irvine Macros
+        for name, data in IRVINE_MACROS.items():
+            if name.lower() == word_lower:
+                return {
+                    "contents": {
+                        "kind": "markdown",
+                        "value": data["doc"]
+                    }
+                }
+
+        # 3. Check Irvine Colors
+        for name, desc in IRVINE_COLORS:
+            if name.lower() == word_lower:
+                return {
+                    "contents": {
+                        "kind": "markdown",
+                        "value": f"### Irvine32 Color: `{name}`\n{desc}"
+                    }
+                }
+
+        # 4. Check x86 Registers
+        if word_lower in X86_REGISTERS:
+            role, desc = X86_REGISTERS[word_lower]
+            return {
+                "contents": {
+                    "kind": "markdown",
+                    "value": f"### Register `{word_lower.upper()}`\n**Role:** {role}\n\n{desc}"
+                }
+            }
+
+        # 5. Check x86 Instructions
+        if word_lower in X86_INSTRUCTIONS:
+            syntax, desc = X86_INSTRUCTIONS[word_lower]
+            return {
+                "contents": {
+                    "kind": "markdown",
+                    "value": f"### Instruction `{word_lower.upper()}`\n**Syntax:** `{syntax}`\n\n{desc}"
+                }
+            }
+
+        # 6. Check MASM Directives
+        for directive, (syntax, desc) in MASM_DIRECTIVES.items():
+            if directive.lower().lstrip(".") == word_lower.lstrip("."):
+                return {
+                    "contents": {
+                        "kind": "markdown",
+                        "value": f"### MASM `{directive}`\n{desc}"
+                    }
+                }
+
+        # 7. Check User Symbols in Current Document
+        doc_syms = self.symbols.get(uri, DocumentSymbols())
+        for name, (l_num, sig) in doc_syms.procedures.items():
+            if name.lower() == word_lower:
+                return {
+                    "contents": {
+                        "kind": "markdown",
+                        "value": f"### Procedure `{name}`\nDefined at line {l_num + 1}\n```assembly\n{sig}\n```"
+                    }
+                }
+
+        for name, (l_num, vtype, val) in doc_syms.variables.items():
+            if name.lower() == word_lower:
+                return {
+                    "contents": {
+                        "kind": "markdown",
+                        "value": f"### Variable `{name}`\n**Type:** `{vtype}`\n**Initial Value:** `{val}`\n**Defined at line:** {l_num + 1}"
+                    }
+                }
+
+        for name, (l_num, text_lbl) in doc_syms.labels.items():
+            if name.lower() == word_lower:
+                return {
+                    "contents": {
+                        "kind": "markdown",
+                        "value": f"### Label `{name}:`\nDefined at line {l_num + 1}"
+                    }
+                }
+
+        for name, (l_num, val) in doc_syms.constants.items():
+            if name.lower() == word_lower:
+                return {
+                    "contents": {
+                        "kind": "markdown",
+                        "value": f"### Constant `{name}`\nValue: `{val}` (line {l_num + 1})"
+                    }
+                }
+
+        return None
+
+    def handle_definition(self, uri: str, line: int, char: int):
+        doc = self.documents.get(uri, "")
+        word = self.get_word_at_pos(doc, line, char)
+        if not word:
+            return None
+
+        word_lower = word.lower()
+        doc_syms = self.symbols.get(uri, DocumentSymbols())
+
+        # Check procedures
+        for name, (l_num, _) in doc_syms.procedures.items():
+            if name.lower() == word_lower:
+                return {
+                    "uri": uri,
+                    "range": {
+                        "start": {"line": l_num, "character": 0},
+                        "end": {"line": l_num, "character": len(name)}
+                    }
+                }
+
+        # Check variables
+        for name, (l_num, _, _) in doc_syms.variables.items():
+            if name.lower() == word_lower:
+                return {
+                    "uri": uri,
+                    "range": {
+                        "start": {"line": l_num, "character": 0},
+                        "end": {"line": l_num, "character": len(name)}
+                    }
+                }
+
+        # Check labels
+        for name, (l_num, _) in doc_syms.labels.items():
+            if name.lower() == word_lower:
+                return {
+                    "uri": uri,
+                    "range": {
+                        "start": {"line": l_num, "character": 0},
+                        "end": {"line": l_num, "character": len(name)}
+                    }
+                }
+
+        # Check constants
+        for name, (l_num, _) in doc_syms.constants.items():
+            if name.lower() == word_lower:
+                return {
+                    "uri": uri,
+                    "range": {
+                        "start": {"line": l_num, "character": 0},
+                        "end": {"line": l_num, "character": len(name)}
+                    }
+                }
+
+        return None
+
+    def handle_document_symbol(self, uri: str):
+        doc_syms = self.symbols.get(uri, DocumentSymbols())
+        symbols = []
+
+        for name, (l_num, sig) in doc_syms.procedures.items():
+            symbols.append({
+                "name": name,
+                "detail": sig,
+                "kind": 12,  # Function
+                "range": {
+                    "start": {"line": l_num, "character": 0},
+                    "end": {"line": l_num, "character": len(sig)}
+                },
+                "selectionRange": {
+                    "start": {"line": l_num, "character": 0},
+                    "end": {"line": l_num, "character": len(name)}
+                }
+            })
+
+        for name, (l_num, vtype, val) in doc_syms.variables.items():
+            symbols.append({
+                "name": name,
+                "detail": f"{vtype} {val}",
+                "kind": 13,  # Variable
+                "range": {
+                    "start": {"line": l_num, "character": 0},
+                    "end": {"line": l_num, "character": len(name)}
+                },
+                "selectionRange": {
+                    "start": {"line": l_num, "character": 0},
+                    "end": {"line": l_num, "character": len(name)}
+                }
+            })
+
+        for name, (l_num, _) in doc_syms.labels.items():
+            symbols.append({
+                "name": name,
+                "detail": "label",
+                "kind": 20,  # Field / Label
+                "range": {
+                    "start": {"line": l_num, "character": 0},
+                    "end": {"line": l_num, "character": len(name)}
+                },
+                "selectionRange": {
+                    "start": {"line": l_num, "character": 0},
+                    "end": {"line": l_num, "character": len(name)}
+                }
+            })
+
+        return symbols
+
+
+def send_response(resp: dict):
+    body = json.dumps(resp)
+    header = f"Content-Length: {len(body.encode('utf-8'))}\r\n\r\n"
+    sys.stdout.write(header + body)
+    sys.stdout.flush()
+
+def main():
+    server = MasmServer()
+    buffer = b""
+
+    while True:
+        try:
+            line = sys.stdin.buffer.readline()
+            if not line:
+                break
+            if line.startswith(b"Content-Length:"):
+                content_length = int(line.split(b":")[1].strip())
+                # Read until empty line
+                while True:
+                    empty_line = sys.stdin.buffer.readline()
+                    if empty_line in (b"\r\n", b"\n", b""):
+                        break
+                
+                body = sys.stdin.buffer.read(content_length)
+                request = json.loads(body.decode("utf-8"))
+                
+                req_id = request.get("id")
+                method = request.get("method")
+                params = request.get("params", {})
+
+                if method == "initialize":
+                    send_response({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "capabilities": {
+                                "textDocumentSync": 1,  # Full sync
+                                "completionProvider": {
+                                    "triggerCharacters": [" ", ",", ".", ":", "@", "+"],
+                                    "resolveProvider": False
+                                },
+                                "hoverProvider": True,
+                                "definitionProvider": True,
+                                "documentSymbolProvider": True
+                            },
+                            "serverInfo": {
+                                "name": "masm-irvine-lsp",
+                                "version": "1.0.0"
+                            }
+                        }
+                    })
+
+                elif method == "initialized":
+                    pass
+
+                elif method == "shutdown":
+                    send_response({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": None
+                    })
+
+                elif method == "exit":
+                    sys.exit(0)
+
+                elif method == "textDocument/didOpen":
+                    td = params.get("textDocument", {})
+                    uri = td.get("uri")
+                    text = td.get("text", "")
+                    server.documents[uri] = text
+                    server.symbols[uri] = parse_document(text)
+
+                elif method == "textDocument/didChange":
+                    td = params.get("textDocument", {})
+                    uri = td.get("uri")
+                    content_changes = params.get("contentChanges", [])
+                    if content_changes:
+                        text = content_changes[-1].get("text", "")
+                        server.documents[uri] = text
+                        server.symbols[uri] = parse_document(text)
+
+                elif method == "textDocument/didClose":
+                    td = params.get("textDocument", {})
+                    uri = td.get("uri")
+                    server.documents.pop(uri, None)
+                    server.symbols.pop(uri, None)
+
+                elif method == "textDocument/completion":
+                    td = params.get("textDocument", {})
+                    pos = params.get("position", {})
+                    result = server.handle_completion(td.get("uri"), pos.get("line", 0), pos.get("character", 0))
+                    send_response({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": result
+                    })
+
+                elif method == "textDocument/hover":
+                    td = params.get("textDocument", {})
+                    pos = params.get("position", {})
+                    result = server.handle_hover(td.get("uri"), pos.get("line", 0), pos.get("character", 0))
+                    send_response({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": result
+                    })
+
+                elif method == "textDocument/definition":
+                    td = params.get("textDocument", {})
+                    pos = params.get("position", {})
+                    result = server.handle_definition(td.get("uri"), pos.get("line", 0), pos.get("character", 0))
+                    send_response({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": result
+                    })
+
+                elif method == "textDocument/documentSymbol":
+                    td = params.get("textDocument", {})
+                    result = server.handle_document_symbol(td.get("uri"))
+                    send_response({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": result
+                    })
+
+                elif req_id is not None:
+                    # Unknown method but has id, return empty result
+                    send_response({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": None
+                    })
+        except Exception as e:
+            # Continue running on malformed messages
+            continue
+
+if __name__ == "__main__":
+    main()
