@@ -43,7 +43,16 @@ This extension & language server (`masm-irvine-lsp`) gives Zed full native Intel
   * **Labels:** `L1:` -> autocompletes with jump instructions (`jmp`, `je`, `jne`, `loop`).
   * **Constants:** `BUFFER_SIZE = 100` or `MAX EQU 50`.
 
-### 5. Instant Code Snippet
+### 5. Real-Time Semantic Diagnostics & Linter (Irvine32-Aware)
+Catches common assembly pitfalls directly inside Zed as you type:
+* **Missing `OFFSET` Warning (`Irvine-001`):** Flags when moving a string variable into `EDX` without `OFFSET` before calling string procedures like `WriteString`.
+* **Unterminated String Warning (`Irvine-002`):** Warns if a string declaration in `.data` is missing its terminating `, 0` when passed to `WriteString`.
+* **Operand Size Mismatch (`MASM-001`):** Flags mismatched bit-widths in instructions (e.g. `mov al, eax`, `add bx, edx`, or mismatch between register and declared variable type).
+* **Missing `exit` before `ENDP` (`Irvine-003`):** Warns if `main PROC` does not call `exit` or `ExitProcess` before `main ENDP`, preventing runaway execution into adjacent memory.
+* **Ambiguous Memory Operand (`MASM-002`):** Warns on ambiguous dereferences like `mov [esi], 5` requiring `BYTE PTR`, `WORD PTR`, or `DWORD PTR`.
+* **Undefined Jump Label (`MASM-003`):** Flags jumps or loops targeting labels that do not exist.
+
+### 6. Instant Code Snippet
 * Typing `template-irvine32` generates a complete, clean MASM + Irvine32 program skeleton ready to build.
 
 ---

@@ -2,7 +2,7 @@
 """
 x86 MASM & Irvine32 Language Server Protocol (LSP) Server
 Provides IntelliSense (autocompletion, hover docs, go-to-definition, document symbols)
-tailored specifically for x86 MASM Assembly and Kip Irvine's Irvine32 library.
+and a real-time Semantic Diagnostics Engine tailored for x86 MASM Assembly and Kip Irvine's Irvine32 library.
 """
 
 import sys
@@ -171,6 +171,16 @@ IRVINE_PROCEDURES = {
         "doc": "### `Str_ucase` (Irvine32)\nConverts null-terminated string to uppercase in-place.\n\n**Inputs:**\n- `EDX` = string offset\n**Outputs:** None",
         "snippet": "mov edx, OFFSET ${1:myString}\ncall Str_ucase"
     },
+    "OpenInputFile": {
+        "detail": "procedure OpenInputFile (EDX = OFFSET filename) -> EAX (handle)",
+        "doc": "### `OpenInputFile` (Irvine32)\nOpens an existing file for input.\n\n**Inputs:**\n- `EDX` = offset of null-terminated filename\n**Outputs:**\n- `EAX` = file handle (or INVALID_HANDLE_VALUE on error)",
+        "snippet": "mov edx, OFFSET ${1:filename}\ncall OpenInputFile"
+    },
+    "CreateOutputFile": {
+        "detail": "procedure CreateOutputFile (EDX = OFFSET filename) -> EAX (handle)",
+        "doc": "### `CreateOutputFile` (Irvine32)\nCreates a new file or overwrites an existing file for output.\n\n**Inputs:**\n- `EDX` = offset of null-terminated filename\n**Outputs:**\n- `EAX` = file handle",
+        "snippet": "mov edx, OFFSET ${1:filename}\ncall CreateOutputFile"
+    },
     "MsgBox": {
         "detail": "procedure MsgBox (EDX = msg, EBX = title)",
         "doc": "### `MsgBox` (Irvine32)\nDisplays a graphical Windows message box with OK button.\n\n**Inputs:**\n- `EDX` = null-terminated message string offset\n- `EBX` = null-terminated title string offset",
@@ -181,6 +191,10 @@ IRVINE_PROCEDURES = {
         "doc": "### `MsgBoxAsk` (Irvine32)\nDisplays a graphical Windows Yes/No message box.\n\n**Inputs:**\n- `EDX` = message offset\n- `EBX` = title offset\n**Outputs:**\n- `EAX` = IDYES (6) or IDNO (7)",
         "snippet": "mov edx, OFFSET ${1:msg}\nmov ebx, OFFSET ${2:title}\ncall MsgBoxAsk"
     }
+}
+
+IRVINE_OFFSET_PROCEDURES = {
+    "writestring", "str_length", "str_ucase", "str_trim", "openinputfile", "createoutputfile"
 }
 
 IRVINE_MACROS = {
@@ -229,6 +243,26 @@ IRVINE_COLORS = [
     ("yellow", "Color 14: yellow"),
     ("white", "Color 15: white")
 ]
+
+REG_WIDTHS = {
+    # 8-bit
+    "al": 8, "ah": 8, "bl": 8, "bh": 8,
+    "cl": 8, "ch": 8, "dl": 8, "dh": 8,
+    # 16-bit
+    "ax": 16, "bx": 16, "cx": 16, "dx": 16,
+    "si": 16, "di": 16, "bp": 16, "sp": 16,
+    # 32-bit
+    "eax": 32, "ebx": 32, "ecx": 32, "edx": 32,
+    "esi": 32, "edi": 32, "ebp": 32, "esp": 32,
+}
+
+VAR_TYPE_WIDTHS = {
+    "BYTE": 8, "SBYTE": 8,
+    "WORD": 16, "SWORD": 16,
+    "DWORD": 32, "SDWORD": 32, "REAL4": 32,
+    "QWORD": 64, "REAL8": 64,
+    "TBYTE": 80,
+}
 
 X86_REGISTERS = {
     # 32-bit
@@ -370,31 +404,59 @@ TEMPLATES = {
 
 class DocumentSymbols:
     def __init__(self):
-        self.procedures = {}  # name -> (line, signature)
+        self.procedures = {}  # name -> (line, signature, end_line)
         self.labels = {}      # name -> (line, text)
-        self.variables = {}   # name -> (line, type, init_val)
+        self.variables = {}   # name -> (line, type, init_val, col_start, col_end)
         self.constants = {}   # name -> (line, val)
+
+def strip_line_comment(line: str) -> str:
+    """Strips comments (; or #) while respecting quotes."""
+    in_quote = False
+    quote_char = ''
+    for i, ch in enumerate(line):
+        if ch in ('"', "'"):
+            if not in_quote:
+                in_quote = True
+                quote_char = ch
+            elif quote_char == ch:
+                in_quote = False
+        elif (ch == ';' or ch == '#') and not in_quote:
+            return line[:i]
+    return line
 
 def parse_document(text: str) -> DocumentSymbols:
     symbols = DocumentSymbols()
     lines = text.split("\n")
     
-    # regexes
-    proc_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+PROC\b(.*)$", re.IGNORECASE)
+    proc_start_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+PROC\b(.*)$", re.IGNORECASE)
+    proc_end_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+ENDP\b", re.IGNORECASE)
     label_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s*:\s*(?:;.*)?$", re.IGNORECASE)
     var_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+(BYTE|SBYTE|WORD|SWORD|DWORD|SDWORD|QWORD|REAL4|REAL8|TBYTE)\s+(.*?)(?:;.*)?$", re.IGNORECASE)
     const_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+(=|EQU)\s+(.*?)(?:;.*)?$", re.IGNORECASE)
+
+    current_proc = None
 
     for i, line in enumerate(lines):
         clean = line.strip()
         if not clean or clean.startswith(";") or clean.startswith("#"):
             continue
             
-        m_proc = proc_pattern.match(line)
+        m_proc = proc_start_pattern.match(line)
         if m_proc:
             name = m_proc.group(1)
             rest = m_proc.group(2).strip()
-            symbols.procedures[name] = (i, f"{name} PROC {rest}".strip())
+            symbols.procedures[name] = [i, f"{name} PROC {rest}".strip(), None]
+            current_proc = name
+            continue
+
+        m_endp = proc_end_pattern.match(line)
+        if m_endp:
+            endp_name = m_endp.group(1)
+            if endp_name in symbols.procedures:
+                symbols.procedures[endp_name][2] = i
+            elif current_proc and current_proc in symbols.procedures:
+                symbols.procedures[current_proc][2] = i
+            current_proc = None
             continue
 
         m_var = var_pattern.match(line)
@@ -402,7 +464,9 @@ def parse_document(text: str) -> DocumentSymbols:
             name = m_var.group(1)
             var_type = m_var.group(2).upper()
             val = m_var.group(3).strip()
-            symbols.variables[name] = (i, var_type, val)
+            col_start = line.find(name)
+            col_end = col_start + len(name)
+            symbols.variables[name] = (i, var_type, val, col_start, col_end)
             continue
 
         m_const = const_pattern.match(line)
@@ -458,6 +522,246 @@ class MasmServer:
             return ""
         return lines[line][:char]
 
+    def compute_diagnostics(self, uri: str) -> list:
+        doc = self.documents.get(uri, "")
+        if not doc:
+            return []
+
+        symbols = self.symbols.get(uri, DocumentSymbols())
+        diagnostics = []
+        lines = doc.split("\n")
+
+        # Map lookup dictionaries (case-insensitive)
+        var_lookup = {k.lower(): (k, v) for k, v in symbols.variables.items()}
+        label_lookup = {k.lower(): k for k in symbols.labels.keys()}
+        proc_lookup = {k.lower(): k for k in symbols.procedures.keys()}
+
+        # -------------------------------------------------------------
+        # Rule 1 & Rule 2: Irvine String Checks (OFFSET & Null-terminator)
+        # -------------------------------------------------------------
+        # Track which variables are passed to WriteString
+        vars_printed_with_writestring = set()
+
+        for i, raw_line in enumerate(lines):
+            code_line = strip_line_comment(raw_line).strip()
+            if not code_line:
+                continue
+
+            # Check: mov edx, <symbol> (Missing OFFSET)
+            m_mov_edx = re.match(r"^mov\s+edx\s*,\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s*$", code_line, re.IGNORECASE)
+            if m_mov_edx:
+                target_sym = m_mov_edx.group(1)
+                target_sym_lower = target_sym.lower()
+
+                if target_sym_lower in var_lookup:
+                    # Look ahead up to 6 non-empty lines to see if call WriteString or Irvine string proc follows
+                    lookahead_found_call = False
+                    for next_i in range(i + 1, min(i + 7, len(lines))):
+                        next_code = strip_line_comment(lines[next_i]).strip()
+                        if not next_code:
+                            continue
+                        m_call = re.match(r"^call\s+([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\b", next_code, re.IGNORECASE)
+                        if m_call and m_call.group(1).lower() in IRVINE_OFFSET_PROCEDURES:
+                            lookahead_found_call = m_call.group(1)
+                            vars_printed_with_writestring.add(target_sym_lower)
+                            break
+                        # If edx is overwritten before call, abort rule
+                        if re.match(r"^(mov|lea|xor)\s+edx\b", next_code, re.IGNORECASE):
+                            break
+
+                    if lookahead_found_call:
+                        # Found missing OFFSET
+                        col_start = raw_line.find(target_sym)
+                        col_end = col_start + len(target_sym) if col_start != -1 else len(raw_line)
+                        diagnostics.append({
+                            "range": {
+                                "start": {"line": i, "character": col_start if col_start != -1 else 0},
+                                "end": {"line": i, "character": col_end}
+                            },
+                            "severity": 1,  # Error
+                            "code": "Irvine-001",
+                            "source": "masm-irvine",
+                            "message": f"Missing 'OFFSET' operator: When calling {lookahead_found_call}, EDX must receive the memory offset ('mov edx, OFFSET {target_sym}'). Moving '{target_sym}' directly dereferences its value, causing an access violation or crash."
+                        })
+
+            # Also check if mov edx, OFFSET <symbol> is used (track for null-terminator rule)
+            m_mov_offset = re.match(r"^mov\s+edx\s*,\s*OFFSET\s+([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s*$", code_line, re.IGNORECASE)
+            if m_mov_offset:
+                target_sym_lower = m_mov_offset.group(1).lower()
+                vars_printed_with_writestring.add(target_sym_lower)
+
+        # Rule 2: Check if strings used with WriteString have trailing null terminator
+        for var_lower in vars_printed_with_writestring:
+            if var_lower in var_lookup:
+                orig_name, (v_line, v_type, v_init, c_start, c_end) = var_lookup[var_lower]
+                if v_type in ("BYTE", "SBYTE") and ('"' in v_init or "'" in v_init):
+                    # Check if ends with null terminator
+                    clean_init = v_init.strip().rstrip(",")
+                    # Matches trailing 0, 0h, 00h, NULL
+                    has_null = bool(re.search(r'(?:,\s*(?:0|0h|00h|NULL|0\b))\s*$', clean_init, re.IGNORECASE))
+                    if not has_null:
+                        diagnostics.append({
+                            "range": {
+                                "start": {"line": v_line, "character": c_start},
+                                "end": {"line": v_line, "character": c_end}
+                            },
+                            "severity": 2,  # Warning
+                            "code": "Irvine-002",
+                            "source": "masm-irvine",
+                            "message": f"String '{orig_name}' is passed to WriteString but is missing a null terminator (', 0'). WriteString will continue printing arbitrary memory past the buffer until it encounters a null byte."
+                        })
+
+        # -------------------------------------------------------------
+        # Rule 3: Operand Size Mismatch & Rule 5: Ambiguous Memory Size
+        # -------------------------------------------------------------
+        two_op_pattern = re.compile(r"^\s*(mov|add|sub|cmp|test|and|or|xor|adc|sbb|xchg)\s+([^,]+),\s*(.+)$", re.IGNORECASE)
+        ambiguous_mem_pattern = re.compile(r"^\s*(mov|add|sub|cmp|and|or|xor)\s+\[([^\]]+)\]\s*,\s*([0-9a-fA-FhHbB]+|-?[0-9]+)\s*$", re.IGNORECASE)
+
+        for i, raw_line in enumerate(lines):
+            code_line = strip_line_comment(raw_line).strip()
+            if not code_line:
+                continue
+
+            # Rule 5: Ambiguous memory operand
+            m_ambig = ambiguous_mem_pattern.match(code_line)
+            if m_ambig and "ptr" not in code_line.lower():
+                diagnostics.append({
+                    "range": {
+                        "start": {"line": i, "character": 0},
+                        "end": {"line": i, "character": len(raw_line)}
+                    },
+                    "severity": 1,  # Error
+                    "code": "MASM-002",
+                    "source": "masm-irvine",
+                    "message": "Ambiguous memory operand size: Immediate operand lacks an explicit size qualifier. Specify 'BYTE PTR', 'WORD PTR', or 'DWORD PTR' (e.g. 'mov BYTE PTR [esi], 5')."
+                })
+                continue
+
+            # Rule 3: Two-operand size consistency
+            m_two = two_op_pattern.match(code_line)
+            if m_two:
+                instr = m_two.group(1).lower()
+                op1_raw = m_two.group(2).strip()
+                op2_raw = m_two.group(3).strip()
+
+                op1_clean = op1_raw.lower()
+                op2_clean = op2_raw.lower()
+
+                # If OFFSET or PTR is involved, size is explicitly modified or address-based
+                if "offset" in op2_clean or "ptr" in op1_clean or "ptr" in op2_clean:
+                    continue
+
+                # Case 3a: Both operands are registers
+                if op1_clean in REG_WIDTHS and op2_clean in REG_WIDTHS:
+                    w1 = REG_WIDTHS[op1_clean]
+                    w2 = REG_WIDTHS[op2_clean]
+                    if w1 != w2:
+                        diagnostics.append({
+                            "range": {
+                                "start": {"line": i, "character": 0},
+                                "end": {"line": i, "character": len(raw_line)}
+                            },
+                            "severity": 1,  # Error
+                            "code": "MASM-001",
+                            "source": "masm-irvine",
+                            "message": f"Operand size mismatch in '{instr.upper()}': '{op1_raw}' is {w1}-bit but '{op2_raw}' is {w2}-bit. Both operands must have matching sizes. (Use MOVZX or MOVSX for zero/sign extension)."
+                        })
+
+                # Case 3b: Op1 is register and Op2 is a declared variable
+                elif op1_clean in REG_WIDTHS and op2_clean in var_lookup:
+                    w1 = REG_WIDTHS[op1_clean]
+                    orig_name, (_, v_type, _, _, _) = var_lookup[op2_clean]
+                    w2 = VAR_TYPE_WIDTHS.get(v_type)
+                    if w2 and w1 != w2:
+                        diagnostics.append({
+                            "range": {
+                                "start": {"line": i, "character": 0},
+                                "end": {"line": i, "character": len(raw_line)}
+                            },
+                            "severity": 1,  # Error
+                            "code": "MASM-001",
+                            "source": "masm-irvine",
+                            "message": f"Operand size mismatch: Register '{op1_raw}' is {w1}-bit but variable '{orig_name}' is {w2}-bit ({v_type}). Use a matching register or type override (e.g. '{v_type} PTR')."
+                        })
+
+                # Case 3c: Op1 is variable and Op2 is register
+                elif op1_clean in var_lookup and op2_clean in REG_WIDTHS:
+                    orig_name, (_, v_type, _, _, _) = var_lookup[op1_clean]
+                    w1 = VAR_TYPE_WIDTHS.get(v_type)
+                    w2 = REG_WIDTHS[op2_clean]
+                    if w1 and w1 != w2:
+                        diagnostics.append({
+                            "range": {
+                                "start": {"line": i, "character": 0},
+                                "end": {"line": i, "character": len(raw_line)}
+                            },
+                            "severity": 1,  # Error
+                            "code": "MASM-001",
+                            "source": "masm-irvine",
+                            "message": f"Operand size mismatch: Variable '{orig_name}' is {w1}-bit ({v_type}) but register '{op2_raw}' is {w2}-bit. Use a matching register."
+                        })
+
+        # -------------------------------------------------------------
+        # Rule 4: Missing exit in main PROC
+        # -------------------------------------------------------------
+        for proc_name, (p_start, sig, p_end) in symbols.procedures.items():
+            if proc_name.lower() in ("main", "_main"):
+                end_line = p_end if p_end is not None else len(lines) - 1
+                has_exit = False
+                for check_i in range(p_start, end_line + 1):
+                    code_check = strip_line_comment(lines[check_i]).strip()
+                    if re.search(r"\bexit\b", code_check, re.IGNORECASE) or \
+                       re.search(r"call\s+ExitProcess\b", code_check, re.IGNORECASE) or \
+                       re.search(r"invoke\s+ExitProcess\b", code_check, re.IGNORECASE):
+                        has_exit = True
+                        break
+
+                if not has_exit and p_end is not None:
+                    diagnostics.append({
+                        "range": {
+                            "start": {"line": p_end, "character": 0},
+                            "end": {"line": p_end, "character": len(lines[p_end])}
+                        },
+                        "severity": 2,  # Warning
+                        "code": "Irvine-003",
+                        "source": "masm-irvine",
+                        "message": f"Procedure '{proc_name}' does not call 'exit' before '{proc_name} ENDP'. Execution will fall through into subsequent memory or procedures."
+                    })
+
+        # -------------------------------------------------------------
+        # Rule 6: Undefined Jump Label
+        # -------------------------------------------------------------
+        jump_pattern = re.compile(r"^\s*(jmp|je|jz|jne|jnz|jg|jge|jl|jle|ja|jae|jb|jbe|jc|jnc|jo|jno|js|jns|loop|loope|loopz|loopne|loopnz)\s+([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s*$", re.IGNORECASE)
+
+        for i, raw_line in enumerate(lines):
+            code_line = strip_line_comment(raw_line).strip()
+            if not code_line:
+                continue
+
+            m_jmp = jump_pattern.match(code_line)
+            if m_jmp:
+                target = m_jmp.group(2)
+                target_lower = target.lower()
+
+                # Ignore relative self-jumps like $
+                if target_lower in ("$", "$+2", "$-2"):
+                    continue
+
+                if target_lower not in label_lookup and target_lower not in proc_lookup:
+                    col_start = raw_line.find(target)
+                    diagnostics.append({
+                        "range": {
+                            "start": {"line": i, "character": col_start if col_start != -1 else 0},
+                            "end": {"line": i, "character": (col_start + len(target)) if col_start != -1 else len(raw_line)}
+                        },
+                        "severity": 1,  # Error
+                        "code": "MASM-003",
+                        "source": "masm-irvine",
+                        "message": f"Undefined jump label: Target label '{target}' is not defined in this document."
+                    })
+
+        return diagnostics
+
     def handle_completion(self, uri: str, line: int, char: int):
         doc = self.documents.get(uri, "")
         prefix = self.get_line_prefix(doc, line, char)
@@ -485,7 +789,9 @@ class MasmServer:
             })
 
         # 2. User Procedures
-        for name, (l_num, sig) in doc_syms.procedures.items():
+        for name, proc_data in doc_syms.procedures.items():
+            l_num = proc_data[0]
+            sig = proc_data[1]
             items.append({
                 "label": name,
                 "kind": 3,  # Function
@@ -497,7 +803,7 @@ class MasmServer:
 
         # 3. User Variables (High priority if after OFFSET)
         var_sort_priority = "01" if is_offset else "07"
-        for name, (l_num, vtype, val) in doc_syms.variables.items():
+        for name, (l_num, vtype, val, _, _) in doc_syms.variables.items():
             items.append({
                 "label": name,
                 "kind": 6,  # Variable
@@ -606,7 +912,6 @@ class MasmServer:
         if not word:
             return None
 
-        # Case-insensitive lookup
         word_lower = word.lower()
 
         # 1. Check Irvine Procedures
@@ -671,8 +976,10 @@ class MasmServer:
 
         # 7. Check User Symbols in Current Document
         doc_syms = self.symbols.get(uri, DocumentSymbols())
-        for name, (l_num, sig) in doc_syms.procedures.items():
+        for name, proc_data in doc_syms.procedures.items():
             if name.lower() == word_lower:
+                l_num = proc_data[0]
+                sig = proc_data[1]
                 return {
                     "contents": {
                         "kind": "markdown",
@@ -680,7 +987,7 @@ class MasmServer:
                     }
                 }
 
-        for name, (l_num, vtype, val) in doc_syms.variables.items():
+        for name, (l_num, vtype, val, _, _) in doc_syms.variables.items():
             if name.lower() == word_lower:
                 return {
                     "contents": {
@@ -719,8 +1026,9 @@ class MasmServer:
         doc_syms = self.symbols.get(uri, DocumentSymbols())
 
         # Check procedures
-        for name, (l_num, _) in doc_syms.procedures.items():
+        for name, proc_data in doc_syms.procedures.items():
             if name.lower() == word_lower:
+                l_num = proc_data[0]
                 return {
                     "uri": uri,
                     "range": {
@@ -730,13 +1038,13 @@ class MasmServer:
                 }
 
         # Check variables
-        for name, (l_num, _, _) in doc_syms.variables.items():
+        for name, (l_num, _, _, c_start, c_end) in doc_syms.variables.items():
             if name.lower() == word_lower:
                 return {
                     "uri": uri,
                     "range": {
-                        "start": {"line": l_num, "character": 0},
-                        "end": {"line": l_num, "character": len(name)}
+                        "start": {"line": l_num, "character": c_start},
+                        "end": {"line": l_num, "character": c_end}
                     }
                 }
 
@@ -768,7 +1076,9 @@ class MasmServer:
         doc_syms = self.symbols.get(uri, DocumentSymbols())
         symbols = []
 
-        for name, (l_num, sig) in doc_syms.procedures.items():
+        for name, proc_data in doc_syms.procedures.items():
+            l_num = proc_data[0]
+            sig = proc_data[1]
             symbols.append({
                 "name": name,
                 "detail": sig,
@@ -783,7 +1093,7 @@ class MasmServer:
                 }
             })
 
-        for name, (l_num, vtype, val) in doc_syms.variables.items():
+        for name, (l_num, vtype, val, c_start, c_end) in doc_syms.variables.items():
             symbols.append({
                 "name": name,
                 "detail": f"{vtype} {val}",
@@ -793,8 +1103,8 @@ class MasmServer:
                     "end": {"line": l_num, "character": len(name)}
                 },
                 "selectionRange": {
-                    "start": {"line": l_num, "character": 0},
-                    "end": {"line": l_num, "character": len(name)}
+                    "start": {"line": l_num, "character": c_start},
+                    "end": {"line": l_num, "character": c_end}
                 }
             })
 
@@ -822,9 +1132,18 @@ def send_response(resp: dict):
     sys.stdout.write(header + body)
     sys.stdout.flush()
 
+def send_notification(method: str, params: dict):
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params
+    })
+    header = f"Content-Length: {len(body.encode('utf-8'))}\r\n\r\n"
+    sys.stdout.write(header + body)
+    sys.stdout.flush()
+
 def main():
     server = MasmServer()
-    buffer = b""
 
     while True:
         try:
@@ -863,7 +1182,7 @@ def main():
                             },
                             "serverInfo": {
                                 "name": "masm-irvine-lsp",
-                                "version": "1.0.0"
+                                "version": "1.1.0"
                             }
                         }
                     })
@@ -887,6 +1206,11 @@ def main():
                     text = td.get("text", "")
                     server.documents[uri] = text
                     server.symbols[uri] = parse_document(text)
+                    diags = server.compute_diagnostics(uri)
+                    send_notification("textDocument/publishDiagnostics", {
+                        "uri": uri,
+                        "diagnostics": diags
+                    })
 
                 elif method == "textDocument/didChange":
                     td = params.get("textDocument", {})
@@ -896,12 +1220,21 @@ def main():
                         text = content_changes[-1].get("text", "")
                         server.documents[uri] = text
                         server.symbols[uri] = parse_document(text)
+                        diags = server.compute_diagnostics(uri)
+                        send_notification("textDocument/publishDiagnostics", {
+                            "uri": uri,
+                            "diagnostics": diags
+                        })
 
                 elif method == "textDocument/didClose":
                     td = params.get("textDocument", {})
                     uri = td.get("uri")
                     server.documents.pop(uri, None)
                     server.symbols.pop(uri, None)
+                    send_notification("textDocument/publishDiagnostics", {
+                        "uri": uri,
+                        "diagnostics": []
+                    })
 
                 elif method == "textDocument/completion":
                     td = params.get("textDocument", {})
@@ -943,14 +1276,12 @@ def main():
                     })
 
                 elif req_id is not None:
-                    # Unknown method but has id, return empty result
                     send_response({
                         "jsonrpc": "2.0",
                         "id": req_id,
                         "result": None
                     })
-        except Exception as e:
-            # Continue running on malformed messages
+        except Exception:
             continue
 
 if __name__ == "__main__":
