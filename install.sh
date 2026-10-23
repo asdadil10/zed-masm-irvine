@@ -3,28 +3,40 @@ set -e
 
 echo "=== Zed x86 MASM + Irvine32 IntelliSense Installer ==="
 
-# 1. Install language server binary
-INSTALL_DIR="$HOME/.local/bin"
+# 1. Install binaries to user local bin
+INSTALL_DIR="${HOME}/.local/bin"
 mkdir -p "$INSTALL_DIR"
-cp -f "$(dirname "$0")/masm-irvine-lsp" "$INSTALL_DIR/masm-irvine-lsp"
+SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Install LSP server
+rm -f "$INSTALL_DIR/masm-irvine-lsp"
+cp -f "$SCRIPT_SOURCE_DIR/masm-irvine-lsp" "$INSTALL_DIR/masm-irvine-lsp"
 chmod +x "$INSTALL_DIR/masm-irvine-lsp"
 echo "[✓] Installed masm-irvine-lsp to $INSTALL_DIR/masm-irvine-lsp"
 
+# Install masm.sh build runner
+if [ -f "$SCRIPT_SOURCE_DIR/masm.sh" ]; then
+    rm -f "$INSTALL_DIR/masm.sh"
+    cp -f "$SCRIPT_SOURCE_DIR/masm.sh" "$INSTALL_DIR/masm.sh"
+    chmod +x "$INSTALL_DIR/masm.sh"
+    echo "[✓] Installed masm.sh to $INSTALL_DIR/masm.sh"
+fi
+
 # 2. Configure Zed settings.json
-ZED_SETTINGS="$HOME/.config/zed/settings.json"
+ZED_SETTINGS="${HOME}/.config/zed/settings.json"
 mkdir -p "$(dirname "$ZED_SETTINGS")"
 
 python3 - << 'EOF'
 import json
 import os
-import sys
+import re
 
-settings_path = os.path.expanduser("~/.config/zed/settings.json")
+home = os.environ.get("HOME", os.path.expanduser("~"))
+settings_path = os.path.join(home, ".config", "zed", "settings.json")
 data = {}
+
 if os.path.exists(settings_path):
     try:
-        # Strip comments if any or simple load
-        import re
         with open(settings_path, 'r') as f:
             content = f.read()
         # Remove single line comments
@@ -43,9 +55,11 @@ data["auto_install_extensions"]["assembly"] = True
 # Ensure lsp configuration
 if "lsp" not in data:
     data["lsp"] = {}
+
+lsp_bin_path = os.path.join(home, ".local", "bin", "masm-irvine-lsp")
 data["lsp"]["asm-lsp"] = {
     "binary": {
-        "path": os.path.expanduser("~/.local/bin/masm-irvine-lsp")
+        "path": lsp_bin_path
     }
 }
 
@@ -64,6 +78,8 @@ EOF
 echo ""
 echo "Installation complete! Restart Zed or open any .asm file to enjoy:"
 echo "  • Full Irvine32 procedure autocompletion and hover docs (WriteString, ReadInt, DumpRegs, etc.)"
+echo "  • Real-time semantic diagnostics (missing OFFSET, unterminated strings, size mismatches)"
 echo "  • x86 instruction reference with operand rules and CPU flags (mov, add, cmp, loop, etc.)"
 echo "  • x86 registers reference with roles (eax, edx, ecx, etc.)"
 echo "  • Dynamic user symbols (variables, labels, procedures) autocompletion and Go-to-Definition"
+echo "  • masm.sh executable runner available at ~/.local/bin/masm.sh"

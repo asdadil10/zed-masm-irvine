@@ -13,7 +13,7 @@ main PROC
     call Clrscr
 
     ; Change text color: yellow text on blue background
-    mov eax, yellow + (blue * 16)
+    mov eax, yellow + (lightRed * 16)
     call SetTextColor
 
     ; Position cursor at row 5, col 10

@@ -1,6 +1,6 @@
-# Zed x86 MASM + Irvine32 IntelliSense Extension & Language Server
+# Zed x86 MASM + Irvine32 IntelliSense Extension & Toolchain
 
-Full Language Server Protocol (LSP) and IntelliSense support for **x86 MASM Assembly** and **Kip Irvine's Irvine32 library** inside the **Zed editor**.
+Full Language Server Protocol (LSP), IntelliSense support, and build automation for **x86 MASM Assembly** and **Kip Irvine's Irvine32 library** inside the **Zed editor**.
 
 ---
 
@@ -10,13 +10,13 @@ The official community Zed extension (`assembly` / `DevBlocky/zed-asm`) connects
 1. **`asm-lsp` targets GAS and NASM on Linux** by running `gcc` or `clang` checks behind the scenes.
 2. It **does not recognize Irvine32 procedures or macros** (`WriteString`, `ReadInt`, `Clrscr`, `DumpRegs`, `mWrite`, etc.).
 3. It gives **no input/output parameter hints** (e.g. that `EDX` must hold `OFFSET string` before `call WriteString`, or that `ReadInt` returns its integer in `EAX`).
-4. It does not index user-defined variables or labels in the `.data` and `.code` sections.
+4. It does not index user-defined variables or labels in `.data` and `.code`.
 
 ---
 
 ## What This Solution Provides
 
-This extension & language server (`masm-irvine-lsp`) gives Zed full native IntelliSense tailored specifically for MASM and Irvine32:
+This extension & language server (`masm-irvine-lsp`) gives Zed native IntelliSense tailored specifically for MASM and Irvine32:
 
 ### 1. Complete Irvine32 Procedure IntelliSense
 * Autocompletes and provides detailed hover tooltips with Markdown documentation, required input/output registers, and code examples for all Irvine32 routines:
@@ -52,27 +52,39 @@ Catches common assembly pitfalls directly inside Zed as you type:
 * **Ambiguous Memory Operand (`MASM-002`):** Warns on ambiguous dereferences like `mov [esi], 5` requiring `BYTE PTR`, `WORD PTR`, or `DWORD PTR`.
 * **Undefined Jump Label (`MASM-003`):** Flags jumps or loops targeting labels that do not exist.
 
-### 6. Instant Code Snippet
+### 6. Portable Assembler & Runner Script (`masm.sh`)
+* Automatically discovers `masm_tools` and Wine runtime dynamically (including Proton or system Wine) with zero hardcoded paths.
+* Supports both assemble-link-and-run and build-only modes:
+  ```bash
+  masm.sh program.asm         # Assemble, link, and run
+  masm.sh program.asm -b      # Build only (generates .exe)
+  ```
+* Preserves and displays compiler and linker errors with syntax line numbers.
+
+### 7. Instant Code Snippet
 * Typing `template-irvine32` generates a complete, clean MASM + Irvine32 program skeleton ready to build.
 
 ---
 
 ## Installation
 
-### Method 1: Automatic 1-Click Script (Recommended)
+### Method 1: Automatic 1-Click Installer (Recommended)
 
-Run the included installer:
+Run the included installer from the project repository:
 ```bash
-cd /home/adil/.gemini/antigravity/scratch/zed-masm-irvine
 ./install.sh
 ```
+This automatically:
+1. Installs `masm-irvine-lsp` and `masm.sh` to `${HOME}/.local/bin/`.
+2. Updates `~/.config/zed/settings.json` with the required LSP mapping and syntax associations.
 
 ### Method 2: Manual Setup
 
-1. Copy `masm-irvine-lsp` into your path:
+1. Copy the binaries to your local bin path:
    ```bash
-   cp masm-irvine-lsp ~/.local/bin/
-   chmod +x ~/.local/bin/masm-irvine-lsp
+   mkdir -p ~/.local/bin
+   cp masm-irvine-lsp masm.sh ~/.local/bin/
+   chmod +x ~/.local/bin/masm-irvine-lsp ~/.local/bin/masm.sh
    ```
 
 2. Open your Zed settings (`Ctrl+,` or `~/.config/zed/settings.json`) and add:
@@ -84,7 +96,7 @@ cd /home/adil/.gemini/antigravity/scratch/zed-masm-irvine
      "lsp": {
        "asm-lsp": {
          "binary": {
-           "path": "/home/adil/.local/bin/masm-irvine-lsp"
+           "path": "~/.local/bin/masm-irvine-lsp"
          }
        }
      },
@@ -94,4 +106,48 @@ cd /home/adil/.gemini/antigravity/scratch/zed-masm-irvine
    }
    ```
 
-3. Open any `.asm` file in Zed!
+---
+
+## 1-Click Zed Build & Run Task Setup
+
+You can configure Zed to compile and run your active MASM file with a single keystroke.
+
+### Step 1: Create a Workspace Task
+
+Create or open `.zed/tasks.json` in your workspace root (e.g. inside your `COAL` project directory):
+
+```json
+[
+  {
+    "label": "MASM: Build & Run",
+    "command": "masm.sh",
+    "args": ["$ZED_FILE"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "MASM: Build Only",
+    "command": "masm.sh",
+    "args": ["$ZED_FILE", "-b"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  }
+]
+```
+
+### Step 2: Triggering the Task
+
+* **Via Command Palette:** Press `Ctrl+Shift+P` -> search **`task: spawn`** -> select `MASM: Build & Run`.
+* **Optional Keybinding:** In your Zed `keymap.json` (`~/.config/zed/keymap.json`), you can bind `Ctrl+R` to run the task whenever an assembly file is open:
+  ```json
+  [
+    {
+      "context": "Editor && (extension == asm || extension == s || extension == inc)",
+      "bindings": {
+        "ctrl-r": ["task::Spawn", { "task_name": "MASM: Build & Run" }]
+      }
+    }
+  ]
+  ```
