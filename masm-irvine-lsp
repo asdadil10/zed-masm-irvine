@@ -271,11 +271,12 @@ REG_WIDTHS = {
 }
 
 VAR_TYPE_WIDTHS = {
-    "BYTE": 8, "SBYTE": 8,
-    "WORD": 16, "SWORD": 16,
-    "DWORD": 32, "SDWORD": 32, "REAL4": 32,
-    "QWORD": 64, "REAL8": 64,
-    "TBYTE": 80,
+    "BYTE": 8, "SBYTE": 8, "DB": 8,
+    "WORD": 16, "SWORD": 16, "DW": 16,
+    "DWORD": 32, "SDWORD": 32, "DD": 32, "REAL4": 32,
+    "FWORD": 48, "DF": 48,
+    "QWORD": 64, "REAL8": 64, "DQ": 64,
+    "TBYTE": 80, "REAL10": 80, "DT": 80,
 }
 
 X86_REGISTERS = {
@@ -457,11 +458,12 @@ def parse_document(text: str) -> DocumentSymbols:
     symbols = DocumentSymbols()
     lines = text.split("\n")
     
+    DATA_TYPES_RE = r"BYTE|SBYTE|DB|WORD|SWORD|DW|DWORD|SDWORD|DD|FWORD|DF|QWORD|DQ|TBYTE|DT|REAL4|REAL8|REAL10"
     proc_start_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+PROC\b(.*)$", re.IGNORECASE)
     proc_end_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+ENDP\b", re.IGNORECASE)
     label_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s*:\s*(?:;.*)?$", re.IGNORECASE)
-    var_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+(BYTE|SBYTE|WORD|SWORD|DWORD|SDWORD|QWORD|REAL4|REAL8|TBYTE)\s+(.*?)(?:;.*)?$", re.IGNORECASE)
-    const_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+(=|EQU)\s+(.*?)(?:;.*)?$", re.IGNORECASE)
+    var_pattern = re.compile(rf"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+({DATA_TYPES_RE})\s+(.*?)(?:;.*)?$", re.IGNORECASE)
+    const_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+(TEXTEQU|EQU|=)\s*(.*?)(?:;.*)?$", re.IGNORECASE)
 
     current_proc = None
 
@@ -519,23 +521,34 @@ def format_masm_document(text: str) -> str:
     lines = text.split("\n")
     out = []
     
-    var_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+(BYTE|SBYTE|WORD|SWORD|DWORD|SDWORD|QWORD|REAL4|REAL8|TBYTE)\b\s*(.*)$", re.IGNORECASE)
+    data_types_re = r"BYTE|SBYTE|DB|WORD|SWORD|DW|DWORD|SDWORD|DD|FWORD|DF|QWORD|DQ|TBYTE|DT|REAL4|REAL8|REAL10"
+    var_pattern = re.compile(rf"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+({data_types_re})\b\s*(.*)$", re.IGNORECASE)
+    const_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+(TEXTEQU|EQU|=)\s*(.*)$", re.IGNORECASE)
     proc_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+(PROC|ENDP)\b\s*(.*)$", re.IGNORECASE)
     label_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s*:\s*$", re.IGNORECASE)
     directive_margin0 = re.compile(r"^\s*(\.[a-zA-Z0-9_]+|INCLUDE|INCLUDELIB|TITLE|END)\b\s*(.*)$", re.IGNORECASE)
 
-    # First pass: find max variable length across data declarations to align types uniformly
+    # First pass: find max identifier and directive lengths across data & constant declarations
     var_lengths = []
+    type_lengths = []
     for line in lines:
         code, _ = split_line_comment(line)
         m_var = var_pattern.match(code)
         if m_var:
             var_lengths.append(len(m_var.group(1)))
+            type_lengths.append(len(m_var.group(2)))
+            continue
+        m_const = const_pattern.match(code)
+        if m_const:
+            var_lengths.append(len(m_const.group(1)))
+            type_lengths.append(len(m_const.group(2)))
+            continue
     
     max_var_len = max(var_lengths) if var_lengths else 10
+    max_type_len = max(type_lengths) if type_lengths else 5
     # Indent is 4. Type starts at type_col (at least 2 spaces past longest var name, rounded to multiple of 4)
     type_col = max(16, ((4 + max_var_len + 2 + 3) // 4) * 4)
-    val_col = type_col + 8
+    val_col = max(type_col + 8, ((type_col + max_type_len + 2 + 3) // 4) * 4)
 
     for line in lines:
         if not line.strip():
@@ -609,7 +622,24 @@ def format_masm_document(text: str) -> str:
             out.append(formatted_code)
             continue
 
-        # 5. Instructions (Col 4 for opcode, Col 12 for operands)
+        # 5. Constants & Text Macros (TEXTEQU, EQU, =)
+        m_const = const_pattern.match(code)
+        if m_const:
+            c_name = m_const.group(1)
+            c_type = m_const.group(2).upper()
+            c_val = m_const.group(3).strip()
+            indent = "    " if has_orig_indent else ""
+            c_indent_len = len(indent)
+            pad1 = max(1, type_col - c_indent_len - len(c_name))
+            pad2 = max(1, val_col - type_col - len(c_type))
+            formatted_code = f"{indent}{c_name}{' ' * pad1}{c_type}{' ' * pad2}{c_val}".rstrip()
+            if comment:
+                pad = 48 - len(formatted_code)
+                formatted_code += (" " * pad if pad > 1 else "  ") + comment
+            out.append(formatted_code)
+            continue
+
+        # 6. Instructions (Col 4 for opcode, Col 12 for operands)
         parts = code.strip().split(None, 1)
         instr = parts[0]
         operands = parts[1].strip() if len(parts) > 1 else ""
