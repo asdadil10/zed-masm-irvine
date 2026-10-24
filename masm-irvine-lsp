@@ -524,6 +524,19 @@ def format_masm_document(text: str) -> str:
     label_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s*:\s*$", re.IGNORECASE)
     directive_margin0 = re.compile(r"^\s*(\.[a-zA-Z0-9_]+|INCLUDE|INCLUDELIB|TITLE|END)\b\s*(.*)$", re.IGNORECASE)
 
+    # First pass: find max variable length across data declarations to align types uniformly
+    var_lengths = []
+    for line in lines:
+        code, _ = split_line_comment(line)
+        m_var = var_pattern.match(code)
+        if m_var:
+            var_lengths.append(len(m_var.group(1)))
+    
+    max_var_len = max(var_lengths) if var_lengths else 10
+    # Indent is 4. Type starts at type_col (at least 2 spaces past longest var name, rounded to multiple of 4)
+    type_col = max(16, ((4 + max_var_len + 2 + 3) // 4) * 4)
+    val_col = type_col + 8
+
     for line in lines:
         if not line.strip():
             out.append("")
@@ -533,7 +546,6 @@ def format_masm_document(text: str) -> str:
         has_orig_indent = line.startswith(" ") or line.startswith("\t")
         
         if not code:
-            # Comment only
             if has_orig_indent:
                 out.append("    " + comment)
             else:
@@ -579,21 +591,25 @@ def format_masm_document(text: str) -> str:
             out.append(formatted_code)
             continue
 
-        # 4. Variables in data segment (Col 4, Col 20, Col 28)
+        # 4. Variables in data segment (Uniform vertical alignment)
         m_var = var_pattern.match(code)
         if m_var:
             v_name = m_var.group(1)
             v_type = m_var.group(2).upper()
             v_val = m_var.group(3).strip()
-            pad_name = max(12, len(v_name))
-            formatted_code = f"    {v_name:<{pad_name}} {v_type:<6} {v_val}".rstrip()
+            # Normalize comma spacing outside quotes or at end of string
+            if v_val.endswith(",0"):
+                v_val = v_val[:-2] + ", 0"
+            pad1 = max(1, type_col - 4 - len(v_name))
+            pad2 = max(1, val_col - type_col - len(v_type))
+            formatted_code = f"    {v_name}{' ' * pad1}{v_type}{' ' * pad2}{v_val}".rstrip()
             if comment:
                 pad = 48 - len(formatted_code)
                 formatted_code += (" " * pad if pad > 1 else "  ") + comment
             out.append(formatted_code)
             continue
 
-        # 5. Instructions (Col 4 for opcode, Col 16 for operands)
+        # 5. Instructions (Col 4 for opcode, Col 12 for operands)
         parts = code.strip().split(None, 1)
         instr = parts[0]
         operands = parts[1].strip() if len(parts) > 1 else ""
@@ -603,7 +619,8 @@ def format_masm_document(text: str) -> str:
             operands = re.sub(r"\s*,\s*", ", ", operands)
             operands = re.sub(r"\b(offset|ptr|lengthof|sizeof|type)\b", lambda m: m.group(1).upper(), operands, flags=re.IGNORECASE)
 
-        formatted_code = f"    {instr:<11} {operands}".rstrip()
+        pad_instr = max(1, 12 - 4 - len(instr))
+        formatted_code = f"    {instr}{' ' * pad_instr}{operands}".rstrip()
         if comment:
             pad = 48 - len(formatted_code)
             formatted_code += (" " * pad if pad > 1 else "  ") + comment
