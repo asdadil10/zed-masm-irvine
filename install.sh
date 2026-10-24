@@ -69,6 +69,17 @@ if "file_types" not in data:
 if "Assembly" not in data["file_types"]:
     data["file_types"]["Assembly"] = ["asm", "s", "S", "inc"]
 
+# Ensure formatting on save for Assembly
+data["format_on_save"] = "on"
+if "languages" not in data:
+    data["languages"] = {}
+if "Assembly" not in data["languages"]:
+    data["languages"]["Assembly"] = {}
+data["languages"]["Assembly"]["tab_size"] = 4
+data["languages"]["Assembly"]["hard_tabs"] = False
+data["languages"]["Assembly"]["format_on_save"] = "on"
+data["languages"]["Assembly"]["formatter"] = "language_server"
+
 with open(settings_path, 'w') as f:
     json.dump(data, f, indent=2)
 
