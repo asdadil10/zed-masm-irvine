@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 x86 MASM & Irvine32 Language Server Protocol (LSP) Server
-Provides IntelliSense (autocompletion, hover docs, go-to-definition, document symbols)
-and a real-time Semantic Diagnostics Engine tailored for x86 MASM Assembly and Kip Irvine's Irvine32 library.
+Provides:
+  - IntelliSense (autocompletion, hover docs, go-to-definition, document symbols)
+  - Real-time Semantic Diagnostics Engine (missing OFFSET, unterminated strings, size mismatches)
+  - 1-Click Code Actions & Quick-Fixes (insert OFFSET, append null-terminator, insert exit)
+  - Opinionated 4-Column MASM Document Formatter (textbook layout: Labels, Opcode, Operands, Comments)
+tailored specifically for x86 MASM Assembly and Kip Irvine's Irvine32 library.
 """
 
 import sys
@@ -404,13 +408,13 @@ TEMPLATES = {
 
 class DocumentSymbols:
     def __init__(self):
-        self.procedures = {}  # name -> (line, signature, end_line)
+        self.procedures = {}  # name -> [line, signature, end_line]
         self.labels = {}      # name -> (line, text)
         self.variables = {}   # name -> (line, type, init_val, col_start, col_end)
         self.constants = {}   # name -> (line, val)
 
-def strip_line_comment(line: str) -> str:
-    """Strips comments (; or #) while respecting quotes."""
+def split_line_comment(line: str):
+    """Splits line into code and trailing comment, respecting quotes."""
     in_quote = False
     quote_char = ''
     for i, ch in enumerate(line):
@@ -421,8 +425,13 @@ def strip_line_comment(line: str) -> str:
             elif quote_char == ch:
                 in_quote = False
         elif (ch == ';' or ch == '#') and not in_quote:
-            return line[:i]
-    return line
+            return line[:i].rstrip(), line[i:].strip()
+    return line.rstrip(), ""
+
+def strip_line_comment(line: str) -> str:
+    """Strips comments while respecting quotes."""
+    code, _ = split_line_comment(line)
+    return code
 
 def parse_document(text: str) -> DocumentSymbols:
     symbols = DocumentSymbols()
@@ -485,6 +494,104 @@ def parse_document(text: str) -> DocumentSymbols:
     return symbols
 
 
+def format_masm_document(text: str) -> str:
+    """Formats an x86 MASM document into the canonical 4-column layout."""
+    lines = text.split("\n")
+    out = []
+    
+    var_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+(BYTE|SBYTE|WORD|SWORD|DWORD|SDWORD|QWORD|REAL4|REAL8|TBYTE)\b\s*(.*)$", re.IGNORECASE)
+    proc_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s+(PROC|ENDP)\b\s*(.*)$", re.IGNORECASE)
+    label_pattern = re.compile(r"^\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s*:\s*$", re.IGNORECASE)
+    directive_margin0 = re.compile(r"^\s*(\.[a-zA-Z0-9_]+|INCLUDE|INCLUDELIB|TITLE|END)\b\s*(.*)$", re.IGNORECASE)
+
+    for line in lines:
+        if not line.strip():
+            out.append("")
+            continue
+            
+        code, comment = split_line_comment(line)
+        has_orig_indent = line.startswith(" ") or line.startswith("\t")
+        
+        if not code:
+            # Comment only
+            if has_orig_indent:
+                out.append("    " + comment)
+            else:
+                out.append(comment)
+            continue
+
+        # 1. Directives at margin 0
+        m_dir = directive_margin0.match(code)
+        if m_dir:
+            dir_name = m_dir.group(1)
+            dir_rest = m_dir.group(2).strip()
+            if dir_name.lower() in ("include", "includelib", "title", "end"):
+                dir_name = dir_name.upper()
+            else:
+                dir_name = dir_name.lower()
+            formatted_code = f"{dir_name} {dir_rest}".rstrip()
+            if comment:
+                pad = 48 - len(formatted_code)
+                formatted_code += (" " * pad if pad > 1 else "  ") + comment
+            out.append(formatted_code)
+            continue
+
+        # 2. Procedures at margin 0
+        m_proc = proc_pattern.match(code)
+        if m_proc:
+            p_name = m_proc.group(1)
+            p_type = m_proc.group(2).upper()
+            p_rest = m_proc.group(3).strip()
+            formatted_code = f"{p_name} {p_type} {p_rest}".rstrip()
+            if comment:
+                pad = 48 - len(formatted_code)
+                formatted_code += (" " * pad if pad > 1 else "  ") + comment
+            out.append(formatted_code)
+            continue
+
+        # 3. Labels at margin 0
+        m_lbl = label_pattern.match(code)
+        if m_lbl:
+            formatted_code = f"{m_lbl.group(1)}:"
+            if comment:
+                pad = 48 - len(formatted_code)
+                formatted_code += (" " * pad if pad > 1 else "  ") + comment
+            out.append(formatted_code)
+            continue
+
+        # 4. Variables in data segment (Col 4, Col 20, Col 28)
+        m_var = var_pattern.match(code)
+        if m_var:
+            v_name = m_var.group(1)
+            v_type = m_var.group(2).upper()
+            v_val = m_var.group(3).strip()
+            pad_name = max(12, len(v_name))
+            formatted_code = f"    {v_name:<{pad_name}} {v_type:<6} {v_val}".rstrip()
+            if comment:
+                pad = 48 - len(formatted_code)
+                formatted_code += (" " * pad if pad > 1 else "  ") + comment
+            out.append(formatted_code)
+            continue
+
+        # 5. Instructions (Col 4 for opcode, Col 16 for operands)
+        parts = code.strip().split(None, 1)
+        instr = parts[0]
+        operands = parts[1].strip() if len(parts) > 1 else ""
+        
+        # Clean operands spacing around comma and standardize operator casing
+        if operands and not ('"' in operands or "'" in operands):
+            operands = re.sub(r"\s*,\s*", ", ", operands)
+            operands = re.sub(r"\b(offset|ptr|lengthof|sizeof|type)\b", lambda m: m.group(1).upper(), operands, flags=re.IGNORECASE)
+
+        formatted_code = f"    {instr:<11} {operands}".rstrip()
+        if comment:
+            pad = 48 - len(formatted_code)
+            formatted_code += (" " * pad if pad > 1 else "  ") + comment
+        out.append(formatted_code)
+
+    return "\n".join(out)
+
+
 class MasmServer:
     def __init__(self):
         self.documents = {}  # uri -> text
@@ -531,17 +638,15 @@ class MasmServer:
         diagnostics = []
         lines = doc.split("\n")
 
-        # Map lookup dictionaries (case-insensitive)
         var_lookup = {k.lower(): (k, v) for k, v in symbols.variables.items()}
         label_lookup = {k.lower(): k for k in symbols.labels.keys()}
         proc_lookup = {k.lower(): k for k in symbols.procedures.keys()}
 
+        vars_printed_with_writestring = set()
+
         # -------------------------------------------------------------
         # Rule 1 & Rule 2: Irvine String Checks (OFFSET & Null-terminator)
         # -------------------------------------------------------------
-        # Track which variables are passed to WriteString
-        vars_printed_with_writestring = set()
-
         for i, raw_line in enumerate(lines):
             code_line = strip_line_comment(raw_line).strip()
             if not code_line:
@@ -554,7 +659,6 @@ class MasmServer:
                 target_sym_lower = target_sym.lower()
 
                 if target_sym_lower in var_lookup:
-                    # Look ahead up to 6 non-empty lines to see if call WriteString or Irvine string proc follows
                     lookahead_found_call = False
                     for next_i in range(i + 1, min(i + 7, len(lines))):
                         next_code = strip_line_comment(lines[next_i]).strip()
@@ -565,12 +669,10 @@ class MasmServer:
                             lookahead_found_call = m_call.group(1)
                             vars_printed_with_writestring.add(target_sym_lower)
                             break
-                        # If edx is overwritten before call, abort rule
                         if re.match(r"^(mov|lea|xor)\s+edx\b", next_code, re.IGNORECASE):
                             break
 
                     if lookahead_found_call:
-                        # Found missing OFFSET
                         col_start = raw_line.find(target_sym)
                         col_end = col_start + len(target_sym) if col_start != -1 else len(raw_line)
                         diagnostics.append({
@@ -581,10 +683,10 @@ class MasmServer:
                             "severity": 1,  # Error
                             "code": "Irvine-001",
                             "source": "masm-irvine",
-                            "message": f"Missing 'OFFSET' operator: When calling {lookahead_found_call}, EDX must receive the memory offset ('mov edx, OFFSET {target_sym}'). Moving '{target_sym}' directly dereferences its value, causing an access violation or crash."
+                            "message": f"Missing 'OFFSET' operator: When calling {lookahead_found_call}, EDX must receive the memory offset ('mov edx, OFFSET {target_sym}'). Moving '{target_sym}' directly dereferences its value, causing an access violation or crash.",
+                            "data": {"symbol": target_sym}
                         })
 
-            # Also check if mov edx, OFFSET <symbol> is used (track for null-terminator rule)
             m_mov_offset = re.match(r"^mov\s+edx\s*,\s*OFFSET\s+([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\s*$", code_line, re.IGNORECASE)
             if m_mov_offset:
                 target_sym_lower = m_mov_offset.group(1).lower()
@@ -595,9 +697,7 @@ class MasmServer:
             if var_lower in var_lookup:
                 orig_name, (v_line, v_type, v_init, c_start, c_end) = var_lookup[var_lower]
                 if v_type in ("BYTE", "SBYTE") and ('"' in v_init or "'" in v_init):
-                    # Check if ends with null terminator
                     clean_init = v_init.strip().rstrip(",")
-                    # Matches trailing 0, 0h, 00h, NULL
                     has_null = bool(re.search(r'(?:,\s*(?:0|0h|00h|NULL|0\b))\s*$', clean_init, re.IGNORECASE))
                     if not has_null:
                         diagnostics.append({
@@ -608,7 +708,8 @@ class MasmServer:
                             "severity": 2,  # Warning
                             "code": "Irvine-002",
                             "source": "masm-irvine",
-                            "message": f"String '{orig_name}' is passed to WriteString but is missing a null terminator (', 0'). WriteString will continue printing arbitrary memory past the buffer until it encounters a null byte."
+                            "message": f"String '{orig_name}' is passed to WriteString but is missing a null terminator (', 0'). WriteString will continue printing arbitrary memory past the buffer until it encounters a null byte.",
+                            "data": {"symbol": orig_name, "line": v_line}
                         })
 
         # -------------------------------------------------------------
@@ -633,7 +734,8 @@ class MasmServer:
                     "severity": 1,  # Error
                     "code": "MASM-002",
                     "source": "masm-irvine",
-                    "message": "Ambiguous memory operand size: Immediate operand lacks an explicit size qualifier. Specify 'BYTE PTR', 'WORD PTR', or 'DWORD PTR' (e.g. 'mov BYTE PTR [esi], 5')."
+                    "message": "Ambiguous memory operand size: Immediate operand lacks an explicit size qualifier. Specify 'BYTE PTR', 'WORD PTR', or 'DWORD PTR' (e.g. 'mov BYTE PTR [esi], 5').",
+                    "data": {"line": i}
                 })
                 continue
 
@@ -647,7 +749,6 @@ class MasmServer:
                 op1_clean = op1_raw.lower()
                 op2_clean = op2_raw.lower()
 
-                # If OFFSET or PTR is involved, size is explicitly modified or address-based
                 if "offset" in op2_clean or "ptr" in op1_clean or "ptr" in op2_clean:
                     continue
 
@@ -664,7 +765,8 @@ class MasmServer:
                             "severity": 1,  # Error
                             "code": "MASM-001",
                             "source": "masm-irvine",
-                            "message": f"Operand size mismatch in '{instr.upper()}': '{op1_raw}' is {w1}-bit but '{op2_raw}' is {w2}-bit. Both operands must have matching sizes. (Use MOVZX or MOVSX for zero/sign extension)."
+                            "message": f"Operand size mismatch in '{instr.upper()}': '{op1_raw}' is {w1}-bit but '{op2_raw}' is {w2}-bit. Both operands must have matching sizes. (Use MOVZX or MOVSX for zero/sign extension).",
+                            "data": {"instr": instr, "op1": op1_raw, "op2": op2_raw, "line": i}
                         })
 
                 # Case 3b: Op1 is register and Op2 is a declared variable
@@ -681,7 +783,8 @@ class MasmServer:
                             "severity": 1,  # Error
                             "code": "MASM-001",
                             "source": "masm-irvine",
-                            "message": f"Operand size mismatch: Register '{op1_raw}' is {w1}-bit but variable '{orig_name}' is {w2}-bit ({v_type}). Use a matching register or type override (e.g. '{v_type} PTR')."
+                            "message": f"Operand size mismatch: Register '{op1_raw}' is {w1}-bit but variable '{orig_name}' is {w2}-bit ({v_type}). Use a matching register or type override (e.g. '{v_type} PTR').",
+                            "data": {"instr": instr, "op1": op1_raw, "op2": orig_name, "line": i}
                         })
 
                 # Case 3c: Op1 is variable and Op2 is register
@@ -698,7 +801,8 @@ class MasmServer:
                             "severity": 1,  # Error
                             "code": "MASM-001",
                             "source": "masm-irvine",
-                            "message": f"Operand size mismatch: Variable '{orig_name}' is {w1}-bit ({v_type}) but register '{op2_raw}' is {w2}-bit. Use a matching register."
+                            "message": f"Operand size mismatch: Variable '{orig_name}' is {w1}-bit ({v_type}) but register '{op2_raw}' is {w2}-bit. Use a matching register.",
+                            "data": {"instr": instr, "op1": orig_name, "op2": op2_raw, "line": i}
                         })
 
         # -------------------------------------------------------------
@@ -725,7 +829,8 @@ class MasmServer:
                         "severity": 2,  # Warning
                         "code": "Irvine-003",
                         "source": "masm-irvine",
-                        "message": f"Procedure '{proc_name}' does not call 'exit' before '{proc_name} ENDP'. Execution will fall through into subsequent memory or procedures."
+                        "message": f"Procedure '{proc_name}' does not call 'exit' before '{proc_name} ENDP'. Execution will fall through into subsequent memory or procedures.",
+                        "data": {"line": p_end}
                     })
 
         # -------------------------------------------------------------
@@ -743,7 +848,6 @@ class MasmServer:
                 target = m_jmp.group(2)
                 target_lower = target.lower()
 
-                # Ignore relative self-jumps like $
                 if target_lower in ("$", "$+2", "$-2"):
                     continue
 
@@ -762,6 +866,196 @@ class MasmServer:
 
         return diagnostics
 
+    def handle_code_action(self, uri: str, range_data: dict, context: dict) -> list:
+        """Generates 1-click Quick-Fix proposals for detected diagnostics."""
+        doc = self.documents.get(uri, "")
+        if not doc:
+            return []
+
+        lines = doc.split("\n")
+        actions = []
+        diagnostics = context.get("diagnostics", [])
+
+        for diag in diagnostics:
+            code = diag.get("code")
+            d_range = diag.get("range", {})
+            start_line = d_range.get("start", {}).get("line", 0)
+
+            # 1. Quick-fix for Irvine-001 (Missing OFFSET)
+            if code == "Irvine-001":
+                target_sym = diag.get("data", {}).get("symbol")
+                if not target_sym and start_line < len(lines):
+                    m = re.search(r"mov\s+edx\s*,\s*([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\b", lines[start_line], re.IGNORECASE)
+                    if m:
+                        target_sym = m.group(1)
+
+                if target_sym:
+                    actions.append({
+                        "title": f"💡 Insert 'OFFSET' operator ('mov edx, OFFSET {target_sym}')",
+                        "kind": "quickfix",
+                        "isPreferred": True,
+                        "diagnostics": [diag],
+                        "edit": {
+                            "changes": {
+                                uri: [
+                                    {
+                                        "range": d_range,
+                                        "newText": f"OFFSET {target_sym}"
+                                    }
+                                ]
+                            }
+                        }
+                    })
+
+            # 2. Quick-fix for Irvine-002 (Unterminated string)
+            elif code == "Irvine-002":
+                if start_line < len(lines):
+                    line_text = lines[start_line]
+                    # Find end of string literal
+                    m_quote = re.search(r'("[^"]*"|\'[^\']*\')', line_text)
+                    if m_quote:
+                        insert_pos = m_quote.end()
+                        actions.append({
+                            "title": "💡 Append null terminator (', 0')",
+                            "kind": "quickfix",
+                            "isPreferred": True,
+                            "diagnostics": [diag],
+                            "edit": {
+                                "changes": {
+                                    uri: [
+                                        {
+                                            "range": {
+                                                "start": {"line": start_line, "character": insert_pos},
+                                                "end": {"line": start_line, "character": insert_pos}
+                                            },
+                                            "newText": ", 0"
+                                        }
+                                    ]
+                                }
+                            }
+                        })
+
+            # 3. Quick-fix for Irvine-003 (Missing exit before ENDP)
+            elif code == "Irvine-003":
+                actions.append({
+                    "title": "💡 Insert 'exit' before ENDP",
+                    "kind": "quickfix",
+                    "isPreferred": True,
+                    "diagnostics": [diag],
+                    "edit": {
+                        "changes": {
+                            uri: [
+                                {
+                                    "range": {
+                                        "start": {"line": start_line, "character": 0},
+                                        "end": {"line": start_line, "character": 0}
+                                    },
+                                    "newText": "    exit\n"
+                                }
+                            ]
+                        }
+                    }
+                })
+
+            # 4. Quick-fix for MASM-001 (Size mismatch -> MOVZX / MOVSX)
+            elif code == "MASM-001":
+                if start_line < len(lines):
+                    line_text = lines[start_line]
+                    m_mov = re.match(r"^(\s*)mov\b", line_text, re.IGNORECASE)
+                    if m_mov:
+                        indent = len(m_mov.group(1))
+                        actions.append({
+                            "title": "💡 Change 'mov' to zero-extending 'movzx'",
+                            "kind": "quickfix",
+                            "isPreferred": True,
+                            "diagnostics": [diag],
+                            "edit": {
+                                "changes": {
+                                    uri: [
+                                        {
+                                            "range": {
+                                                "start": {"line": start_line, "character": indent},
+                                                "end": {"line": start_line, "character": indent + 3}
+                                            },
+                                            "newText": "movzx"
+                                        }
+                                    ]
+                                }
+                            }
+                        })
+                        actions.append({
+                            "title": "💡 Change 'mov' to sign-extending 'movsx'",
+                            "kind": "quickfix",
+                            "isPreferred": False,
+                            "diagnostics": [diag],
+                            "edit": {
+                                "changes": {
+                                    uri: [
+                                        {
+                                            "range": {
+                                                "start": {"line": start_line, "character": indent},
+                                                "end": {"line": start_line, "character": indent + 3}
+                                            },
+                                            "newText": "movsx"
+                                        }
+                                    ]
+                                }
+                            }
+                        })
+
+            # 5. Quick-fix for MASM-002 (Ambiguous memory size)
+            elif code == "MASM-002":
+                if start_line < len(lines):
+                    line_text = lines[start_line]
+                    b_idx = line_text.find('[')
+                    if b_idx != -1:
+                        for ptr_type in ("DWORD PTR ", "BYTE PTR ", "WORD PTR "):
+                            actions.append({
+                                "title": f"💡 Specify '{ptr_type.strip()}'",
+                                "kind": "quickfix",
+                                "isPreferred": (ptr_type == "DWORD PTR "),
+                                "diagnostics": [diag],
+                                "edit": {
+                                    "changes": {
+                                        uri: [
+                                            {
+                                                "range": {
+                                                    "start": {"line": start_line, "character": b_idx},
+                                                    "end": {"line": start_line, "character": b_idx}
+                                                },
+                                                "newText": ptr_type
+                                            }
+                                        ]
+                                    }
+                                }
+                            })
+
+        return actions
+
+    def handle_formatting(self, uri: str, options: dict) -> list:
+        """Formats the entire document according to the canonical 4-column layout."""
+        doc = self.documents.get(uri, "")
+        if not doc:
+            return []
+
+        formatted = format_masm_document(doc)
+        if formatted == doc:
+            return []
+
+        lines = doc.split("\n")
+        last_line = len(lines) - 1
+        last_char = len(lines[-1]) if lines else 0
+
+        return [
+            {
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": last_line, "character": last_char}
+                },
+                "newText": formatted
+            }
+        ]
+
     def handle_completion(self, uri: str, line: int, char: int):
         doc = self.documents.get(uri, "")
         prefix = self.get_line_prefix(doc, line, char)
@@ -769,7 +1063,6 @@ class MasmServer:
         
         items = []
 
-        # Context detection
         stripped_prefix = prefix.strip()
         is_call = bool(re.search(r"\bcall\s+[a-zA-Z0-9_@$?]*$", prefix, re.IGNORECASE))
         is_offset = bool(re.search(r"\bOFFSET\s+[a-zA-Z0-9_@$?]*$", prefix, re.IGNORECASE))
@@ -914,7 +1207,6 @@ class MasmServer:
 
         word_lower = word.lower()
 
-        # 1. Check Irvine Procedures
         for name, data in IRVINE_PROCEDURES.items():
             if name.lower() == word_lower:
                 return {
@@ -924,7 +1216,6 @@ class MasmServer:
                     }
                 }
 
-        # 2. Check Irvine Macros
         for name, data in IRVINE_MACROS.items():
             if name.lower() == word_lower:
                 return {
@@ -934,7 +1225,6 @@ class MasmServer:
                     }
                 }
 
-        # 3. Check Irvine Colors
         for name, desc in IRVINE_COLORS:
             if name.lower() == word_lower:
                 return {
@@ -944,7 +1234,6 @@ class MasmServer:
                     }
                 }
 
-        # 4. Check x86 Registers
         if word_lower in X86_REGISTERS:
             role, desc = X86_REGISTERS[word_lower]
             return {
@@ -954,7 +1243,6 @@ class MasmServer:
                 }
             }
 
-        # 5. Check x86 Instructions
         if word_lower in X86_INSTRUCTIONS:
             syntax, desc = X86_INSTRUCTIONS[word_lower]
             return {
@@ -964,7 +1252,6 @@ class MasmServer:
                 }
             }
 
-        # 6. Check MASM Directives
         for directive, (syntax, desc) in MASM_DIRECTIVES.items():
             if directive.lower().lstrip(".") == word_lower.lstrip("."):
                 return {
@@ -974,7 +1261,6 @@ class MasmServer:
                     }
                 }
 
-        # 7. Check User Symbols in Current Document
         doc_syms = self.symbols.get(uri, DocumentSymbols())
         for name, proc_data in doc_syms.procedures.items():
             if name.lower() == word_lower:
@@ -1025,7 +1311,6 @@ class MasmServer:
         word_lower = word.lower()
         doc_syms = self.symbols.get(uri, DocumentSymbols())
 
-        # Check procedures
         for name, proc_data in doc_syms.procedures.items():
             if name.lower() == word_lower:
                 l_num = proc_data[0]
@@ -1037,7 +1322,6 @@ class MasmServer:
                     }
                 }
 
-        # Check variables
         for name, (l_num, _, _, c_start, c_end) in doc_syms.variables.items():
             if name.lower() == word_lower:
                 return {
@@ -1048,7 +1332,6 @@ class MasmServer:
                     }
                 }
 
-        # Check labels
         for name, (l_num, _) in doc_syms.labels.items():
             if name.lower() == word_lower:
                 return {
@@ -1059,7 +1342,6 @@ class MasmServer:
                     }
                 }
 
-        # Check constants
         for name, (l_num, _) in doc_syms.constants.items():
             if name.lower() == word_lower:
                 return {
@@ -1152,7 +1434,6 @@ def main():
                 break
             if line.startswith(b"Content-Length:"):
                 content_length = int(line.split(b":")[1].strip())
-                # Read until empty line
                 while True:
                     empty_line = sys.stdin.buffer.readline()
                     if empty_line in (b"\r\n", b"\n", b""):
@@ -1178,11 +1459,13 @@ def main():
                                 },
                                 "hoverProvider": True,
                                 "definitionProvider": True,
-                                "documentSymbolProvider": True
+                                "documentSymbolProvider": True,
+                                "documentFormattingProvider": True,
+                                "codeActionProvider": True
                             },
                             "serverInfo": {
                                 "name": "masm-irvine-lsp",
-                                "version": "1.1.0"
+                                "version": "1.2.0"
                             }
                         }
                     })
@@ -1234,6 +1517,27 @@ def main():
                     send_notification("textDocument/publishDiagnostics", {
                         "uri": uri,
                         "diagnostics": []
+                    })
+
+                elif method == "textDocument/formatting":
+                    td = params.get("textDocument", {})
+                    options = params.get("options", {})
+                    result = server.handle_formatting(td.get("uri"), options)
+                    send_response({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": result
+                    })
+
+                elif method == "textDocument/codeAction":
+                    td = params.get("textDocument", {})
+                    range_data = params.get("range", {})
+                    context = params.get("context", {})
+                    result = server.handle_code_action(td.get("uri"), range_data, context)
+                    send_response({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": result
                     })
 
                 elif method == "textDocument/completion":

@@ -52,7 +52,22 @@ Catches common assembly pitfalls directly inside Zed as you type:
 * **Ambiguous Memory Operand (`MASM-002`):** Warns on ambiguous dereferences like `mov [esi], 5` requiring `BYTE PTR`, `WORD PTR`, or `DWORD PTR`.
 * **Undefined Jump Label (`MASM-003`):** Flags jumps or loops targeting labels that do not exist.
 
-### 6. Portable Assembler & Runner Script (`masm.sh`)
+### 6. 1-Click Code Actions & Quick-Fixes (`Alt+Enter`)
+Provides automated 1-click repairs for compiler and linter diagnostics directly in Zed via the quick-fix lightbulb (`Alt+Enter`):
+* 💡 **Insert 'OFFSET' operator:** Automatically fixes `mov edx, myMsg` into `mov edx, OFFSET myMsg`.
+* 💡 **Append null terminator (', 0'):** Automatically adds `, 0` to un-terminated byte strings in `.data`.
+* 💡 **Insert 'exit' before ENDP:** Automatically inserts `exit` statement before procedure end.
+* 💡 **Convert to zero-extending 'movzx':** Automatically fixes register/operand width mismatches.
+* 💡 **Specify 'DWORD PTR' / 'BYTE PTR':** Automatically qualifies ambiguous memory dereferences.
+
+### 7. Opinionated 4-Column MASM Formatter (`Ctrl+S` / Format Document)
+Automatically beautifies and aligns code into textbook standard layout:
+* **Margin 0:** Labels, Segment Directives (`.data`, `.code`), Procedure definitions (`main PROC`, `ENDP`), and `INCLUDE` / `TITLE` / `END`.
+* **Column 4:** Instructions (`mov`, `call`, `add`) and data directives (`BYTE`, `DWORD`).
+* **Column 16:** Operands (`edx, OFFSET myMsg`, `eax, 5`), with operators like `OFFSET` and `PTR` cleanly capitalized.
+* **Column 48:** Trailing comments (`; ...`), uniformly aligned.
+
+### 8. Portable Assembler & Runner Script (`masm.sh`)
 * Automatically discovers `masm_tools` and Wine runtime dynamically (including Proton or system Wine) with zero hardcoded paths.
 * Supports both assemble-link-and-run and build-only modes:
   ```bash
