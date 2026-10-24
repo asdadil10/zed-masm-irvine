@@ -75,18 +75,32 @@ export WINEDEBUG=-all,err-all,fixme-all
 export WINEPREFIX="$PREFIX_DIR"
 
 if [ -z "$1" ]; then
-    echo "Usage: ./masm.sh <source-file.asm|source-file.s> [--build-only|-b]"
+    echo "Usage: ./masm.sh <source-file.asm|source-file.s> [--build-only|-b] [--debug|-d]"
     echo "Examples:"
     echo "  ./masm.sh main.asm        # Assemble, link, and run"
     echo "  ./masm.sh main.asm -b     # Build only (no run)"
+    echo "  ./masm.sh main.asm -d     # Assemble with debug symbols & start WineDbg"
     exit 1
 fi
 
 SRC_FILE="$1"
+shift
 BUILD_ONLY=false
-if [ "$2" == "--build-only" ] || [ "$2" == "-b" ]; then
-    BUILD_ONLY=true
-fi
+DEBUG_MODE=false
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --build-only|-b)
+            BUILD_ONLY=true
+            ;;
+        --debug|-d)
+            DEBUG_MODE=true
+            ;;
+        *)
+            ;;
+    esac
+    shift
+done
 
 if [ ! -f "$SRC_FILE" ]; then
     echo "Error: File '$SRC_FILE' not found."
@@ -114,14 +128,39 @@ W_IRVINE="$(to_wine_path "$IRVINE_DIR")"
 W_ML="$(to_wine_path "$BIN_DIR/ml.exe")"
 W_LINK="$(to_wine_path "$BIN_DIR/link.exe")"
 
+ML_FLAGS="/c /coff"
+LINK_FLAGS="/NOLOGO /SUBSYSTEM:CONSOLE"
+
+if [ "$DEBUG_MODE" = true ]; then
+    ML_FLAGS="$ML_FLAGS /Zi"
+    LINK_FLAGS="$LINK_FLAGS /DEBUG"
+fi
+
 echo "[1/2] Assembling $BASENAME..."
-"$WINE_BIN" "$W_ML" /c /coff /I"$W_IRVINE" /Fo"$W_OBJ" "$W_SRC"
+"$WINE_BIN" "$W_ML" $ML_FLAGS /I"$W_IRVINE" /Fo"$W_OBJ" "$W_SRC"
 
 echo "[2/2] Linking $NAME.obj with Irvine32..."
-"$WINE_BIN" "$W_LINK" /NOLOGO /SUBSYSTEM:CONSOLE /LIBPATH:"$W_IRVINE" Irvine32.lib Kernel32.Lib User32.Lib /OUT:"$W_EXE" "$W_OBJ"
+"$WINE_BIN" "$W_LINK" $LINK_FLAGS /LIBPATH:"$W_IRVINE" Irvine32.lib Kernel32.Lib User32.Lib /OUT:"$W_EXE" "$W_OBJ"
 
 if [ "$BUILD_ONLY" = true ]; then
     echo "Build succeeded: $EXE_FILE"
+    exit 0
+fi
+
+if [ "$DEBUG_MODE" = true ]; then
+    echo "=================================================="
+    echo "Starting WineDbg interactive debugger for $NAME.exe"
+    echo "Debugger Commands Cheatsheet:"
+    echo "  b *main         : Set breakpoint at main procedure"
+    echo "  c (cont)        : Continue running until breakpoint or crash"
+    echo "  s (step)        : Step into source line"
+    echo "  n (next)        : Step over source line"
+    echo "  si (stepi)      : Step one machine instruction"
+    echo "  info registers  : Inspect EAX, EBX, ECX, EDX, ESI, EDI, ESP, EBP, EFLAGS"
+    echo "  x/4x \$esp       : Examine memory at stack pointer"
+    echo "  q (quit)        : Exit debugger"
+    echo "=================================================="
+    "$WINE_BIN" winedbg "$W_EXE"
     exit 0
 fi
 

@@ -13,6 +13,16 @@ import sys
 import json
 import re
 import os
+from datetime import datetime
+
+LOG_FILE = "/tmp/masm-lsp.log"
+
+def log_debug(msg):
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] {msg}\n")
+    except Exception:
+        pass
 
 IRVINE_PROCEDURES = {
     "Clrscr": {
@@ -403,6 +413,16 @@ TEMPLATES = {
         "detail": "Template: Standard MASM + Irvine32 Program",
         "doc": "Inserts complete starter template for an x86 MASM program using Irvine32.",
         "snippet": "TITLE ${1:Program Title}\n\nINCLUDE Irvine32.inc\n\n.data\n    ${2:myMsg} BYTE \"${3:Hello, World!}\", 0\n\n.code\nmain PROC\n    mov edx, OFFSET ${2:myMsg}\n    call WriteString\n    call Crlf\n\n    exit\nmain ENDP\nEND main\n"
+    },
+    "dump-regs-pause": {
+        "detail": "Snippet: Call DumpRegs + WaitMsg",
+        "doc": "Dumps all CPU registers and flags to console and pauses for user input.",
+        "snippet": "call DumpRegs\ncall WaitMsg\n"
+    },
+    "dump-array": {
+        "detail": "Snippet: Call DumpMem for array",
+        "doc": "Dumps formatted memory block to console using starting address, element count, and unit size.",
+        "snippet": "mov esi, OFFSET ${1:array}\nmov ecx, LENGTHOF ${1:array}\nmov ebx, TYPE ${1:array}\ncall DumpMem\ncall Crlf\n"
     }
 }
 
@@ -634,7 +654,9 @@ class MasmServer:
         if not doc:
             return []
 
-        symbols = self.symbols.get(uri, DocumentSymbols())
+        if uri not in self.symbols or not self.symbols[uri].procedures:
+            self.symbols[uri] = parse_document(doc)
+        symbols = self.symbols[uri]
         diagnostics = []
         lines = doc.split("\n")
 
@@ -864,6 +886,104 @@ class MasmServer:
                         "message": f"Undefined jump label: Target label '{target}' is not defined in this document."
                     })
 
+        # -------------------------------------------------------------
+        # Stage 3: Data-Flow Hazards (EAX overwrite, EDX clobber, Loop ECX)
+        # -------------------------------------------------------------
+
+        # Hazard 1: Loop ECX Modification Hazard (Irvine-HAZ-003)
+        lbl_map = {k.lower(): v for k, v in symbols.labels.items()}
+        for i, raw_line in enumerate(lines):
+            code_line = strip_line_comment(raw_line).strip()
+            if not code_line:
+                continue
+            m_loop = re.match(r"^loop\s+([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\b", code_line, re.IGNORECASE)
+            if m_loop:
+                target = m_loop.group(1).lower()
+                if target in lbl_map:
+                    start_l = lbl_map[target][0]
+                    if start_l < i:
+                        for loop_i in range(start_l + 1, i):
+                            l_raw = lines[loop_i]
+                            l_code = strip_line_comment(l_raw).strip()
+                            if re.search(r"\b(mov|add|sub|inc|dec|xor|shr|shl|mul|div)\s+(ecx|cl|ch|cx)\b", l_code, re.IGNORECASE) or \
+                               re.search(r"\bcall\s+ReadString\b", l_code, re.IGNORECASE):
+                                diagnostics.append({
+                                    "range": {
+                                        "start": {"line": loop_i, "character": 0},
+                                        "end": {"line": loop_i, "character": len(l_raw)}
+                                    },
+                                    "severity": 2,  # Warning
+                                    "code": "Irvine-HAZ-003",
+                                    "source": "masm-irvine",
+                                    "message": f"Loop Hazard: Modifying ECX inside a loop body (lines {start_l+1}..{i+1}) disrupts the 'LOOP' counter, causing an infinite loop or premature exit.",
+                                    "data": {"line": loop_i}
+                                })
+
+        # Hazard 2: EDX Clobbered by 32-bit Multiply/Divide (Irvine-HAZ-002)
+        for i, raw_line in enumerate(lines):
+            code_line = strip_line_comment(raw_line).strip()
+            if not code_line:
+                continue
+            m_edx = re.match(r"^mov\s+edx\s*,\s*OFFSET\s+([a-zA-Z_@$?][a-zA-Z0-9_@$?]*)\b", code_line, re.IGNORECASE)
+            if m_edx:
+                var_name = m_edx.group(1)
+                for next_i in range(i + 1, min(i + 10, len(lines))):
+                    next_raw = lines[next_i]
+                    next_code = strip_line_comment(next_raw).strip()
+                    if not next_code:
+                        continue
+                    if re.match(r"^(mul|div|idiv)\s+([a-zA-Z0-9_@$?\[\]]+)", next_code, re.IGNORECASE):
+                        instr = next_code.split()[0].upper()
+                        diagnostics.append({
+                            "range": {
+                                "start": {"line": next_i, "character": 0},
+                                "end": {"line": next_i, "character": len(next_raw)}
+                            },
+                            "severity": 2,  # Warning
+                            "code": "Irvine-HAZ-002",
+                            "source": "masm-irvine",
+                            "message": f"Register Hazard: 32-bit '{instr}' overwrites EDX (used for high 32 bits of EDX:EAX product/remainder). String pointer to '{var_name}' loaded on line {i+1} is destroyed.",
+                            "data": {"line": next_i, "var": var_name}
+                        })
+                        break
+                    if re.match(r"^call\s+WriteString\b", next_code, re.IGNORECASE):
+                        break
+                    if re.match(r"^(mov|lea)\s+edx\b", next_code, re.IGNORECASE):
+                        break
+
+        # Hazard 3: EAX Overwritten by ReadInt / ReadString without read (Irvine-HAZ-001)
+        for i, raw_line in enumerate(lines):
+            code_line = strip_line_comment(raw_line).strip()
+            if not code_line:
+                continue
+            m_eax = re.match(r"^(mov|add|sub|imul)\s+eax\s*,\s*([^\s;]+)", code_line, re.IGNORECASE)
+            if m_eax:
+                val_loaded = m_eax.group(2)
+                for next_i in range(i + 1, min(i + 7, len(lines))):
+                    next_raw = lines[next_i]
+                    next_code = strip_line_comment(next_raw).strip()
+                    if not next_code:
+                        continue
+                    if re.match(r"^call\s+(ReadString|ReadInt|RandomRange|Random32)\b", next_code, re.IGNORECASE):
+                        called_proc = next_code.split()[1]
+                        diagnostics.append({
+                            "range": {
+                                "start": {"line": next_i, "character": 0},
+                                "end": {"line": next_i, "character": len(next_raw)}
+                            },
+                            "severity": 2,  # Warning
+                            "code": "Irvine-HAZ-001",
+                            "source": "masm-irvine",
+                            "message": f"Register Hazard: Calling '{called_proc}' overwrites EAX. Value '{val_loaded}' loaded into EAX on line {i+1} is discarded before being read or saved.",
+                            "data": {"line": next_i, "val": val_loaded}
+                        })
+                        break
+                    if re.search(r"\b(mov|push|cmp|add|sub)\s+[^,]+,\s*eax\b", next_code, re.IGNORECASE) or \
+                       re.search(r"\bpush\s+eax\b", next_code, re.IGNORECASE):
+                        break
+                    if re.match(r"^mov\s+eax\b", next_code, re.IGNORECASE):
+                        break
+
         return diagnostics
 
     def handle_code_action(self, uri: str, range_data: dict, context: dict) -> list:
@@ -1029,6 +1149,87 @@ class MasmServer:
                                     }
                                 }
                             })
+
+            # 6. Quick-fix for Irvine-HAZ-003 (Preserve ECX in loop)
+            elif code == "Irvine-HAZ-003":
+                if start_line < len(lines):
+                    line_text = lines[start_line]
+                    indent = len(line_text) - len(line_text.lstrip())
+                    sp = " " * indent
+                    actions.append({
+                        "title": "💡 Preserve ECX using 'push ecx' and 'pop ecx'",
+                        "kind": "quickfix",
+                        "isPreferred": True,
+                        "diagnostics": [diag],
+                        "edit": {
+                            "changes": {
+                                uri: [
+                                    {
+                                        "range": {"start": {"line": start_line, "character": 0}, "end": {"line": start_line, "character": 0}},
+                                        "newText": f"{sp}push ecx\n"
+                                    },
+                                    {
+                                        "range": {"start": {"line": start_line + 1, "character": 0}, "end": {"line": start_line + 1, "character": 0}},
+                                        "newText": f"{sp}pop  ecx\n"
+                                    }
+                                ]
+                            }
+                        }
+                    })
+
+            # 7. Quick-fix for Irvine-HAZ-001 (Preserve EAX around clobbering call)
+            elif code == "Irvine-HAZ-001":
+                if start_line < len(lines):
+                    line_text = lines[start_line]
+                    indent = len(line_text) - len(line_text.lstrip())
+                    sp = " " * indent
+                    actions.append({
+                        "title": "💡 Preserve EAX with 'push eax' and 'pop eax'",
+                        "kind": "quickfix",
+                        "isPreferred": True,
+                        "diagnostics": [diag],
+                        "edit": {
+                            "changes": {
+                                uri: [
+                                    {
+                                        "range": {"start": {"line": start_line, "character": 0}, "end": {"line": start_line, "character": 0}},
+                                        "newText": f"{sp}push eax\n"
+                                    },
+                                    {
+                                        "range": {"start": {"line": start_line + 1, "character": 0}, "end": {"line": start_line + 1, "character": 0}},
+                                        "newText": f"{sp}pop  eax\n"
+                                    }
+                                ]
+                            }
+                        }
+                    })
+
+            # 8. Quick-fix for Irvine-HAZ-002 (Preserve EDX pointer around 32-bit MUL/DIV)
+            elif code == "Irvine-HAZ-002":
+                if start_line < len(lines):
+                    line_text = lines[start_line]
+                    indent = len(line_text) - len(line_text.lstrip())
+                    sp = " " * indent
+                    actions.append({
+                        "title": "💡 Preserve EDX pointer with 'push edx' and 'pop edx'",
+                        "kind": "quickfix",
+                        "isPreferred": True,
+                        "diagnostics": [diag],
+                        "edit": {
+                            "changes": {
+                                uri: [
+                                    {
+                                        "range": {"start": {"line": start_line, "character": 0}, "end": {"line": start_line, "character": 0}},
+                                        "newText": f"{sp}push edx\n"
+                                    },
+                                    {
+                                        "range": {"start": {"line": start_line + 1, "character": 0}, "end": {"line": start_line + 1, "character": 0}},
+                                        "newText": f"{sp}pop  edx\n"
+                                    }
+                                ]
+                            }
+                        }
+                    })
 
         return actions
 
@@ -1426,11 +1627,13 @@ def send_notification(method: str, params: dict):
 
 def main():
     server = MasmServer()
+    log_debug("MASM-Irvine LSP started")
 
     while True:
         try:
             line = sys.stdin.buffer.readline()
             if not line:
+                log_debug("STDIN closed (EOF), exiting")
                 break
             if line.startswith(b"Content-Length:"):
                 content_length = int(line.split(b":")[1].strip())
@@ -1445,6 +1648,7 @@ def main():
                 req_id = request.get("id")
                 method = request.get("method")
                 params = request.get("params", {})
+                log_debug(f"Received request: method={method}, id={req_id}")
 
                 if method == "initialize":
                     send_response({
@@ -1585,7 +1789,10 @@ def main():
                         "id": req_id,
                         "result": None
                     })
-        except Exception:
+        except Exception as e:
+            log_debug(f"Exception in main loop: {e}")
+            import traceback
+            log_debug(traceback.format_exc())
             continue
 
 if __name__ == "__main__":

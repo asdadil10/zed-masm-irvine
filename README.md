@@ -53,31 +53,56 @@ Catches common assembly pitfalls directly inside Zed as you type:
 * **Undefined Jump Label (`MASM-003`):** Flags jumps or loops targeting labels that do not exist.
 
 ### 6. 1-Click Code Actions & Quick-Fixes (`Alt+Enter`)
-Provides automated 1-click repairs for compiler and linter diagnostics directly in Zed via the quick-fix lightbulb (`Alt+Enter`):
+Provides automated 1-click repairs for compiler, linter, and hazard diagnostics directly in Zed via the quick-fix lightbulb (`Alt+Enter`):
 * 💡 **Insert 'OFFSET' operator:** Automatically fixes `mov edx, myMsg` into `mov edx, OFFSET myMsg`.
 * 💡 **Append null terminator (', 0'):** Automatically adds `, 0` to un-terminated byte strings in `.data`.
 * 💡 **Insert 'exit' before ENDP:** Automatically inserts `exit` statement before procedure end.
 * 💡 **Convert to zero-extending 'movzx':** Automatically fixes register/operand width mismatches.
 * 💡 **Specify 'DWORD PTR' / 'BYTE PTR':** Automatically qualifies ambiguous memory dereferences.
+* 💡 **Preserve ECX in loop body (`Irvine-HAZ-003`):** Automatically wraps ECX-modifying instructions in `push ecx` and `pop ecx`.
+* 💡 **Preserve EAX before call (`Irvine-HAZ-001`):** Automatically preserves active EAX with `push eax` / `pop eax`.
+* 💡 **Preserve EDX pointer (`Irvine-HAZ-002`):** Automatically saves EDX string pointer around 32-bit `mul`/`div`.
 
-### 7. Opinionated 4-Column MASM Formatter (`Ctrl+S` / Format Document)
+### 7. Data-Flow Hazard Analysis (Stage 3)
+Warns against catastrophic runtime logic bugs before compiling:
+* **EAX Overwrite Hazard (`Irvine-HAZ-001`):** Detects when a value loaded into `EAX` is clobbered by calls to `ReadInt`, `ReadString`, or `RandomRange` without ever being read or pushed.
+* **EDX String Pointer Clobber (`Irvine-HAZ-002`):** Warns if a 32-bit `MUL`, `DIV`, or `IDIV` instruction occurs between `mov edx, OFFSET msg` and `call WriteString`, since 32-bit multiplication/division uses `EDX` for the high 32 bits of the product or remainder.
+* **Loop Counter Hazard (`Irvine-HAZ-003`):** Detects modifications to `ECX` (or calls to `ReadString`) inside a `LOOP` body, preventing infinite loops or premature loop termination.
+
+### 8. Opinionated 4-Column MASM Formatter (`Ctrl+S` / Format Document)
 Automatically beautifies and aligns code into textbook standard layout:
 * **Margin 0:** Labels, Segment Directives (`.data`, `.code`), Procedure definitions (`main PROC`, `ENDP`), and `INCLUDE` / `TITLE` / `END`.
 * **Column 4:** Instructions (`mov`, `call`, `add`) and data directives (`BYTE`, `DWORD`).
 * **Column 16:** Operands (`edx, OFFSET myMsg`, `eax, 5`), with operators like `OFFSET` and `PTR` cleanly capitalized.
 * **Column 48:** Trailing comments (`; ...`), uniformly aligned.
 
-### 8. Portable Assembler & Runner Script (`masm.sh`)
+### 9. Interactive Step-Debugging with WineDbg (Stage 3)
+* Fully integrated source-level step debugging via `masm.sh -d`:
+  * Compiles with `/Zi` (CodeView symbols) and links with `/DEBUG` (PDB symbol generation).
+  * Automatically spawns `winedbg` attached to your program with source line and register inspection.
+  * Debugger Cheatsheet:
+    * `b *main` : Break at procedure entry
+    * `c` : Continue running until breakpoint or crash
+    * `s` : Single step source line
+    * `si` : Single step machine instruction
+    * `info registers` : Display all 32-bit registers and status flags
+    * `x/4x $esp` : Inspect top of stack
+    * `q` : Exit debugger
+
+### 10. Portable Assembler & Runner Script (`masm.sh`)
 * Automatically discovers `masm_tools` and Wine runtime dynamically (including Proton or system Wine) with zero hardcoded paths.
-* Supports both assemble-link-and-run and build-only modes:
+* Supports build-and-run, build-only, and interactive debug modes:
   ```bash
   masm.sh program.asm         # Assemble, link, and run
   masm.sh program.asm -b      # Build only (generates .exe)
+  masm.sh program.asm -d      # Assemble with debug symbols & start WineDbg
   ```
 * Preserves and displays compiler and linker errors with syntax line numbers.
 
-### 7. Instant Code Snippet
-* Typing `template-irvine32` generates a complete, clean MASM + Irvine32 program skeleton ready to build.
+### 11. Productivity Code Templates & Snippets
+* `template-irvine32`: Complete starter skeleton for a clean MASM + Irvine32 application.
+* `dump-regs-pause`: Inserts `call DumpRegs` + `call WaitMsg` for instant register inspection.
+* `dump-array`: Generates full `DumpMem` invocation block for array inspections.
 
 ---
 
@@ -148,20 +173,29 @@ Create or open `.zed/tasks.json` in your workspace root (e.g. inside your `COAL`
     "use_new_terminal": false,
     "allow_concurrent_runs": false,
     "reveal": "always"
+  },
+  {
+    "label": "MASM: Debug with WineDbg",
+    "command": "masm.sh",
+    "args": ["$ZED_FILE", "-d"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
   }
 ]
 ```
 
 ### Step 2: Triggering the Task
 
-* **Via Command Palette:** Press `Ctrl+Shift+P` -> search **`task: spawn`** -> select `MASM: Build & Run`.
-* **Optional Keybinding:** In your Zed `keymap.json` (`~/.config/zed/keymap.json`), you can bind `Ctrl+R` to run the task whenever an assembly file is open:
+* **Via Command Palette:** Press `Ctrl+Shift+P` -> search **`task: spawn`** -> select `MASM: Build & Run` or `MASM: Debug with WineDbg`.
+* **Optional Keybindings:** In your Zed `keymap.json` (`~/.config/zed/keymap.json`), you can bind shortcuts to run or debug whenever an assembly file is open:
   ```json
   [
     {
       "context": "Editor && (extension == asm || extension == s || extension == inc)",
       "bindings": {
-        "ctrl-r": ["task::Spawn", { "task_name": "MASM: Build & Run" }]
+        "ctrl-r": ["task::Spawn", { "task_name": "MASM: Build & Run" }],
+        "f5": ["task::Spawn", { "task_name": "MASM: Debug with WineDbg" }]
       }
     }
   ]

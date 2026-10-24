@@ -1,0 +1,26 @@
+[
+  {
+    "label": "MASM: Build & Run",
+    "command": "./masm.sh",
+    "args": ["$ZED_FILE"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "MASM: Build Only",
+    "command": "./masm.sh",
+    "args": ["$ZED_FILE", "-b"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "MASM: Debug with WineDbg",
+    "command": "./masm.sh",
+    "args": ["$ZED_FILE", "-d"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  }
+]
